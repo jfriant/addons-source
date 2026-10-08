@@ -1,0 +1,6272 @@
+#
+# Gramps - a GTK+/GNOME based genealogy program
+#
+# Copyright (C) 2026 Douglas S. Blank <doug.blank@gmail.com>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+
+"""
+Database backend that mirrors a Gramps Web API server locally.
+
+Design
+------
+This subclasses the stock SQLite DBAPI backend rather than DbReadBase /
+DbWriteBase directly. DbGeneric (gramps.gen.db.generic) already implements
+every get_*_from_handle / iter_* / get_number_of_* method generically on
+top of a small Connection-like object (execute/fetchone/fetchall/commit/
+table_exists/...) -- see SQLite in gramps/plugins/db/dbapi/sqlite.py. So
+reads only need a local, fast, complete SQLite mirror; nothing above the
+Connection layer needs reimplementing.
+
+The mirror is kept current via GET /api/transactions/history/?after=<ts>,
+the same per-object transaction log gramps-web-api's own undo system uses
+(gramps_webapi/undodb.py's DbUndoSQLWeb.get_transactions()). Confirmed
+against a live server: each entry is a *transaction* dict with a nested
+"changes" list, each change carrying obj_class ("Person", "Family", ...),
+trans_type (TXNADD=0/TXNUPD=1/TXNDEL=2), obj_handle, and -- when the
+"new" query param is set -- new_data, a "_class"-tagged dict in the same
+shape gramps.gen.lib.json_utils.data_to_object() reconstructs objects
+from (it's literally what the server's own object_to_data(obj) produced
+when the change was committed). So syncing is: remember the timestamp of
+the last transaction applied, ask for everything after it, and for each
+change either data_to_object(new_data) + commit_<type>() (add and update
+both being upserts, no need to distinguish) or remove_<type>() for a
+delete.
+
+This "_class"-tagged new_data shape is only produced by gramps-web-api
+servers running against Gramps >= 6.0; a server still on Gramps 5.2 (e.g.
+gramps-web-api itself untouched) serializes objects differently (no
+"_class"/"value"/"string" triplet on GrampsType-derived fields), and
+data_to_object() raises KeyError on it. Confirmed against a live gramps52
+server: read-only endpoints (auth, /trees/, /people/ counts, etc.) work
+fine, but _sync_from_server_async() cannot deserialize its transaction history.
+
+Credentials come from a single environment variable, GRAMPS_WEB_API_KEY
+(see webapi_client.py for its "<REFRESH_TOKEN>*<BASE64URL(URL)>" shape and
+the tradeoffs of using a refresh token here rather than a real scoped
+personal-access-token). There is deliberately no per-tree settings.ini and
+no login dialog: the same env var also works as a bare SDK credential
+(WebApiHandler.from_env()) for scripts that talk to the server directly,
+without going through Gramps at all -- one credential, two consumers.
+
+Because of that, nothing but the Family Tree's own name ties its local
+mirror to one particular server account. _check_identity_async() requires that
+name to be "<username>@<host>" (modulo Gramps' own filename-safe-character
+substitution on tree names, e.g. dots -> underscores -- see
+_FAMILY_TREE_NAME_UNSAFE_CHARS) for whoever GRAMPS_WEB_API_KEY currently
+authenticates as, checked on every load() -- so pointing the env var at a
+different account while reopening the same Family Tree fails loudly
+instead of quietly mixing that account's data into the old mirror.
+
+Write-through (local edits pushed back to the server) hooks
+transaction_commit() rather than the individual commit_person/
+commit_family/... methods: DbTxn.__exit__ calls self.db.transaction_commit
+(gramps/gen/db/txn.py) exactly once per completed local transaction, and
+DbTxn already accumulates every add/update/delete in that transaction via
+its own get_recnos()/get_record() -- transaction_to_json() below turns
+that into the flat {type, handle, _class, old, new} list POST
+/transactions/ expects (confirmed against base.py's own POST /people/
+handler, which builds its response the same way). This must run *before*
+super().transaction_commit(), since DBAPI.transaction_commit() clears the
+transaction's records as its last step.
+
+The other place a DbTxn gets used is _sync_from_server_async() itself, applying
+server-pulled changes -- that uses batch=True, and DBAPI._commit_base()
+skips trans.add() entirely for batch transactions (see dbapi.py), so
+transaction_to_json() naturally sees nothing there and no push happens.
+No separate "am I currently syncing" flag is needed to stop synced
+changes from being echoed straight back to the server.
+
+_sync_from_server_async() can only replay what the history feed actually
+logged, and a batch=True commit -- any bulk import, merge, or tool run
+through gramps-web-api, not just a one-off -- logs nothing per-object:
+DBAPI's own commit_*/remove_* methods guard their trans.add() undo-log
+call with `if not trans.batch`, so a batch transaction leaves behind an
+empty-changes marker (a real Transaction row, but with no Change rows)
+instead of the usual per-object entries. Confirmed live: bulk-importing
+example.gramps produced exactly one such marker, and the 2157 people it
+added were otherwise invisible to this addon's sync no matter how often
+it resynced, because the transaction history itself never recorded
+them. _sync_from_server_async() treats an empty-changes transaction as a
+signal that its history-replay approach cannot describe what happened,
+and falls back to _full_resync_async() -- downloading the server's current
+full Gramps XML export and reimporting it into a wiped local mirror,
+the only way to recover completeness when the incremental feed has a
+blind spot by construction.
+
+An empty-changes marker is not the only shape that blind spot takes: a
+server whose tree was populated without gramps-web-api recording any
+history at all (a server-side import straight into the database, a
+restored dump, a truncated history table) has no history to describe
+what it holds -- https://demo.grampsweb.org is exactly that, 4668 people
+against a history that was empty until someone edited it through the
+API. Replaying such a feed produces a mirror holding only the few edits
+the history does know about, with nothing to distinguish that from a
+correct sync. load() therefore checks the mirror's own object total
+against the server's after each sync (_mirror_is_short_of_the_server_async(),
+via _sync_from_server_async()'s verify_totals) and routes a shortfall to the
+same _full_resync_async(). Comparing totals rather than watching for an empty
+feed is what makes the case detectable: one API edit against such a
+server is enough for the feed to hand back a transaction and for the
+sync to look like it worked. The ongoing poll (_poll_tick(), see
+VERIFY_TOTALS_POLL_INTERVAL_SECONDS) asks for the same check too, just on
+an hourly cadence rather than every tick, so this blind spot opening up
+while a tree is already sitting open -- not just at the moment it's
+opened -- gets caught within the hour instead of only at the next
+load().
+
+Pushes go out without force=1, so the server compares each item's "old"
+snapshot against its own current data and rejects the whole batch with
+WebApiPushConflict (see webapi_client.push_transaction()) if anything
+changed server-side since the local mirror last synced -- a real, if
+coarse, optimistic-concurrency check: the whole push either applies or
+none of it does, with no indication of which item conflicted.
+
+The incremental history feed can't be trusted to explain a conflict, and
+this is not a one-server edge case: gramps-web-api's bulk-import path
+(POST /importers/<ext>/file -- GEDCOM, Gramps XML, CSV, ...) runs the
+same batch=True import machinery a local Gramps client's own Import menu
+action would, which never touches its transaction-history table at all
+(DBAPI's own _commit_base() only calls trans.add() when `not
+trans.batch`) -- ordinary server administration for any real
+installation, not a quirk of any particular one. So the incremental
+history feed can be blind to an object's true current state from the
+moment it was imported, indefinitely -- and a totals comparison
+(_mirror_is_short_of_the_server_async(), the verify_totals check load() and
+_sync_from_server_async() use elsewhere) can't catch this either, since the
+object count doesn't change when an already-known object's content
+changes server-side, only when objects are added or removed.
+
+A per-object fix was tried and doesn't work: gramps-web-api's REST
+single-object endpoints (GET /<type>/<handle>) serialize with
+GrampsJSONEncoder.extract_object() (gramps_webapi/api/resources/
+emit.py) -- a walk of the object's own __dict__/properties for the
+frontend's display schema, with no "_class" tag on GrampsType-derived
+fields -- not the gramps.gen.lib.json_utils shape data_to_object()
+needs to reconstruct a Gramps object; feeding it that shape raises
+KeyError. Only two things produce the compatible shape: the
+transaction-history feed's new_data, and a raw Gramps XML export (see
+_full_resync_async()). So on a conflict, _push_payload_async() below does a full
+resync (_resync_after_conflict_async(), reusing _full_resync_async()) -- expensive,
+but the only server round-trip that reliably brings the local mirror
+back to the server's true current state for whatever this push touched
+-- and then, for a plain commit (not an undo/redo -- see
+_retry_after_conflict()), replays the intended *new* state as a fresh
+local edit via commit_<type>()/remove_<type>(). That fresh edit goes
+through the normal transaction_commit() -> _start_push() path again
+with is_retry=True, so it now carries an "old" snapshot matching the
+just-resynced mirror, and will only be rejected a second time if
+something changes server-side in the brief window since the resync ran
+-- in which case it is logged and dropped rather than retried again, to
+avoid retrying forever against a genuinely hot object.
+
+A Gramps XML export isn't perfectly round-trip-faithful either, though:
+it has no element for Person.birth_ref_index/death_ref_index (see
+exportxml.py's write_person()), so ImportXml recomputes both from
+document order on the way back in instead of preserving them -- wrong
+whenever the true index was -1 despite a BIRTH/DEATH-type event ref
+existing, or pointed at something other than the first such ref. Since
+diff_items() (the same function old_unchanged() uses server-side) treats
+those two fields as ordinary content, a Person whose true index doesn't
+match that heuristic would otherwise disagree with the server after
+every single resync, forever, for reasons unrelated to anything actually
+edited. _snapshot_birth_death_indices()/_restore_birth_death_indices()
+carry the pre-resync value back across the reimport, closing that gap --
+by relocating the specific EventRef each index actually identifies
+(_relocate_birth_death_index()), not a bare integer position, so an
+unrelated addition/removal/reorder elsewhere in that Person's
+event_ref_list no longer forfeits the restore the way an earlier,
+whole-list-signature version of this mechanism did.
+
+For an add/update whose object still exists server-side (i.e. the
+conflicting edit changed the same object rather than deleting it),
+_merge_or_overwrite() below combines the two edits with the object's own
+merge() -- the same list-unioning logic behind Gramps' Merge People/
+Family/... tools (ported from GrampsWebSync's diffhandler.py, credit
+David Straub, same license) -- rather than letting the retry blindly
+clobber whatever the other side changed. merge(current, acquisition) is
+called as current.merge(acquisition) with current the server's post-
+resync copy and acquisition the local edit, so a *list*-valued field
+(notes, citations, media, urls, event/family refs, tags, ...) is
+unioned -- both sides' items survive. Two fields get their own special-
+cased merge beyond that: privacy is OR'd (PrivacyBase._merge_privacy():
+``self.private = self.private or other.private``, so the merged object
+is private if either side marked it private), and Person.merge() keeps
+current's own primary name but demotes acquisition's into current's
+alternate_names list rather than discarding it.
+
+Any *other* field -- a plain scalar (date, place, description, gender,
+...) merge() has no handling for at all -- is left at current's own
+value by merge() itself (confirmed empirically: merge(FEMALE-current,
+MALE-local) keeps FEMALE), which would silently discard acquisition's
+edit to it even when nothing about that field actually collided.
+_apply_uncontested_scalar_edits() below layers a real per-field 3-way
+merge on top to fix exactly that: using entry["old"] (the payload's own
+pre-edit snapshot, threaded through as _merge_or_overwrite()'s optional
+old_data) as the true merge base, any such field acquisition is the
+*only* side to have touched gets applied on top of merge()'s result --
+so a conflict on one field of an object no longer costs an unrelated
+edit to a different field on that same object. Genuine field-level
+conflict *resolution* -- both sides touching the identical field to
+different values -- has no algorithmic answer (there is no "more
+correct" of two different birth dates) and is deliberately left at
+current's value, same as before, with _SCALAR_MERGE_LOCKED_FIELDS
+excluding the handful of fields (currently just Person.primary_name)
+whose merge() already has real special-cased handling that this generic
+layer would otherwise fight rather than complement.
+
+For that remaining, truly irreconcilable case, silently losing the
+discarded value is not acceptable either: _discarded_scalar_fields()
+below re-diffs current/acquisition/merged-result field by field (reusing
+gramps.gen.merge.diff.diff_items(), the same function the server's own
+old_unchanged() check uses) to find exactly which top-level fields
+acquisition touched that the merged result still doesn't reflect.
+
+Three more genuine-conflict shapes get the same treatment, each unable
+to reuse that same current-vs-merged-result comparison for its own
+reason: _demoted_field_conflicts() covers a _SCALAR_MERGE_LOCKED_FIELDS
+field (Person.primary_name) -- current.primary_name never changes value
+regardless of whether local_obj's edit to it collided with anything, so
+"touched" has to be checked directly against old_data instead;
+_actively_resolved_conflicts() covers a _SCALAR_MERGE_ACTIVELY_RESOLVED_
+FIELDS field (Citation.confidence, whose level_priority rule reassigns
+it on *every* merge() call, collision or not, so "merge() changed it"
+can't mean "there was a conflict" the way it does for every other
+field); and _prune_dangling_references()'s own pruned list (threaded
+through as _merge_or_overwrite()'s optional pruned parameter) covers a
+Tag/Note/Citation reference the other side deleted entirely -- a
+delete-vs-reference conflict, not a same-field value disagreement, but
+a genuine one whenever it fires. _conflict_summary_lines() below
+combines all four into the lines one Note records. Deliberately never
+triggered by an uncontested edit (only one side touched the field) or a
+successful list union (two different Tags/Notes/... both added --
+merge()'s equivalence-checked unioning, gen/lib/*base.py's various
+_merge_*_list() methods, means this is never itself a source of
+duplicate entries either) -- only a real, two-sided disagreement is
+worth a human's attention; see TODO.md's "Only do for CONFLICTS" note.
+
+There is deliberately no synchronous "pick a winner" prompt anywhere in
+this addon (no login dialog, no settings.ini, no wizard -- a background
+poll tick can't demand a decision mid-session), so automatic resolution
+stays automatic; what changes is that it is no longer silent. That Note
+is tagged the way gramps-connect's own message-note convention already
+is -- a plain Note
+(NoteType untouched) tagged "message" plus "todo-open" (see
+../gramps-connect/app/src/store/notesApi.ts) -- so the record shows up
+as a review-worthy message in gramps-connect's Messages view for free,
+and degrades to an ordinary tagged note anywhere that doesn't know the
+convention (gramps-web, desktop Gramps). It runs as its own, separate
+local transaction, committed only after _retry_after_conflict()'s own
+DbTxn has already landed -- see that
+method's docstring for why. If the push fails for a non-conflict reason
+(network error, auth failure), the local commit has already happened and
+is not rolled back -- the local mirror just drifts from the server until
+the next successful push or read sync.
+
+Not every local batch=True commit is a pull-side replay, though: the same
+trans.batch guard that makes _sync_from_server_async()'s own replay silent to
+transaction_to_json() applies equally to *local* bulk operations run
+against this open tree from outside this file entirely -- ImportXml/
+ImportGedcom/ImportCsv/..., and stock Tools like Check and Repair
+Database, Media Manager, Extract Information from Names, Rename Event
+Types, Reorder Gramps IDs, and Sort Events all open their own DbTxn with
+batch=True for performance. Left alone, any of those would apply locally
+and never reach the server: transaction_commit() would see the same empty
+transaction_to_json() payload it correctly sees for _sync_from_server_async()'s
+own pull-side batch replay, with nothing in the payload itself to tell the
+two apart. transaction_begin() (called by DbTxn.__enter__, so before the
+batch operation's body runs) tells them apart with a _pulling flag set
+only around _sync_from_server_async()'s own batch DbTxns (including the ones
+_full_resync_async() opens) -- everywhere else, a batch=True transaction gets a
+full snapshot of every primary object's current data stashed on the
+transaction itself (_snapshot_all_objects()), not just which handles
+exist. transaction_commit() diffs that snapshot against a fresh one taken
+right after the commit (_reconcile_batch_commit()) to reconstruct what
+changed: a handle that appeared is an add ("old": None); one that
+disappeared is a delete ("old" the pre-transaction data); one that
+persisted is an update only if its content actually differs, compared
+with gramps.gen.merge.diff.diff_items() -- the same function gramps-web-
+api's own old_unchanged() conflict check uses server-side, so this
+addon's "did it change" agrees with the server's. (An earlier version of
+this used handle presence plus a `.change`-timestamp comparison instead
+of a real content diff, and replayed each reconstructed entry through
+_retry_after_conflict() to pick up an "old" snapshot -- three separate
+bugs followed from that: `.change` (whole seconds) compared against the
+transaction's own start_time (a sub-second float) silently missed any
+edit landing in the same wall-clock second the batch began in, which is
+the common case; replaying against local storage that by then already
+held the batch's own result sent the object's *post*-batch content as
+"old" instead of what the server last actually saw, which a real
+server's own old-data check always reads as a conflict; and replaying a
+delete against storage where the object was already legitimately gone
+did nothing at all. Building the payload directly from the two
+snapshots, with real "old" data captured before anything ran, avoids
+all three.) The reconstructed payload goes out through the normal
+transaction_commit() -> _start_push() path, with the same conflict
+handling (full resync, then _retry_after_conflict()) any other edit
+gets, for the rare case something else changed the same object in the
+meantime. Reading (and briefly holding in memory) two full copies of
+every primary object's data per batch commit is a real cost, but
+_snapshot_all_objects() keeps it to O(types) bulk queries rather than
+O(handles) individual ones, and correctness here is worth more than the
+memory -- the same trade _full_resync_async() already makes for the
+equivalent pull-side blind spot.
+
+A second, previously-unhandled kind of silent drift: when a push's own
+HTTP call fails for a plain connectivity reason (network down, server
+unreachable -- not a conflict), the local commit has already happened and
+is never rolled back, but until now nothing remembered that the push
+still needed to go out -- "the next successful push or read sync" above
+was aspirational, not implemented. _push_payload_async() now persists such a
+payload (via _set_metadata(), the same mechanism sync_last_id already
+uses, so it survives close()/reopen) to a "pending_pushes" queue instead
+of just logging and forgetting it. _flush_pending_pushes_async(), called at the
+top of every _sync_from_server_async() (both the load()-time call and every
+poll tick), retries the queue in order and stops at the first entry that
+still can't be delivered, rather than skipping ahead -- so a later,
+causally-dependent edit (e.g. a Family added after the Person it
+references) can never reach the server ahead of an earlier one still
+stuck behind a connectivity failure.
+
+Not every push failure is worth queueing, though: a 4xx other than 429 is
+the server's considered answer about the request itself and will not
+change on replay, so _is_retryable_push_error() sends those straight to a
+loud log instead -- queueing one would retry it on every poll forever and
+eventually evict genuinely retryable work from the capped queue. That log
+line alone used to be the end of it, silently: local and server diverge
+for that edit's object(s) with nothing else to show for it. Every point
+that gives up on a payload this way -- a fresh push's own non-retryable
+rejection, a queued push that comes back a conflict or non-retryable on
+replay, or an entry evicted from the queue outright -- now also calls
+_record_undelivered_push_notes(), reusing _record_conflict_notes()'s own
+message-note machinery (same tags, same author, same separate-
+transaction timing) to attach a note to each affected object explaining
+why. _is_message_note_push() guards every one of those call sites: it
+checks a failing payload's own "message" (forwarded from its local
+DbTxn's description) against _message_note_description(), so a message
+note that itself fails to sync the same way doesn't recursively spawn
+another note about that failure -- confirmed against a real database,
+not just reasoned about, since InlineTaskRunner-driven tests resolve the
+whole nested chain synchronously and would hang or blow the stack
+otherwise, not just log an extra line.
+
+The most likely such rejection is a permissions one, and _check_
+permissions() checks for it up front at load() -- but only ViewPrivate is
+fatal to opening the tree at all: gates GET /transactions/history/, and its
+absence would otherwise be *silent* rather than merely loud, since POST
+/exporters/gramps/file does not refuse a request lacking it -- it passes
+view_private=has_permissions({PERM_VIEW_PRIVATE}) into the export task
+(exporters.py), so an under-privileged caller gets a privacy-filtered
+export, which _full_resync_async() would then import over a wiped local mirror,
+quietly dropping every private record from the mirror. A tree opened
+read-only (DBMODE_R) never pushes, so it is checked for ViewPrivate only.
+
+A writable tree missing AddObject/EditObject/DeleteObject -- gramps-web-api
+gates POST /transactions/ behind all three at once (transactions.py's
+require_permissions(); has_permissions() fails if any are missing) -- does
+*not* fail load(): the mirror still opens and keeps polling and staying
+current for reading, and self._missing_write_permissions names the
+shortfall in one loud log line so the user finds out before ever
+attempting an edit. An actual write is refused synchronously, at the
+point of the attempt: transaction_commit() checks
+self._missing_write_permissions itself and, for a genuine local edit
+(not self._pulling's server-to-local replays, or self._recording_note's
+own bookkeeping -- see both flags' own comments), calls
+transaction_abort() and raises DbWriteFailure before anything reaches
+self.dbapi as committed, rather than letting it commit locally and
+finding out only when the resulting push comes back 403. undo()/redo()
+do the same, before even calling super() -- Gramps core's own undo/redo
+machinery (DbGenericUndo) commits directly, bypassing
+transaction_commit() entirely, so there is no later point at which
+either could still be intercepted. This is strictly better than the
+push-time rejection below where it is possible (no wasted round trip, no
+local/server divergence to explain after the fact -- see
+_missing_write_permission_error()), but it can only ever catch what is
+already known at load() time: a permission *revoked* mid-session is
+still invisible until the next push actually goes out and comes back
+403, handled by _push_payload_async()'s existing non-retryable-rejection
+path (logged, and recorded as a note on the affected object(s) -- see
+below). Checking the permission set up front costs no extra round trip
+(gramps-web-api puts it in the access token's own claims, so
+get_permissions() just decodes the JWT already in hand) and names
+exactly what is missing either way.
+
+GET /metadata/ (cached per handler; needs no special permission) supplies
+the two versions the addon reasons about. The server's *Gramps* version
+gates compatibility outright: _check_server_version_async() refuses at load()
+below MIN_SERVER_GRAMPS_VERSION, since anything older serializes its
+transaction history in the pre-6.0 shape and would otherwise fail much
+later as a bare KeyError out of data_to_object() mid-sync. It is
+deliberately lenient about a server that reports no parseable version at
+all -- better to try than to block on a guess.
+
+The server's *gramps-web-api* version gates one optimization: from 2.7,
+POST /transactions/ accepts ?background=1, queueing the work and
+answering 202 immediately instead of holding the connection open while it
+processes. _push_payload_async() uses that only for payloads at or above
+BACKGROUND_PUSH_THRESHOLD, where server-side processing could plausibly
+outlast webapi_client.TIMEOUT and drop the connection mid-write -- most of
+all the single large payload _reconcile_batch_commit() builds after a bulk
+import. Everything smaller stays synchronous, which is simpler and keeps
+the crisp "400 means conflict" semantics. Two asymmetries make the
+backgrounded path trickier than just adding a query parameter, both
+absorbed inside push_transaction() so callers see identical behavior
+either way: the server only really backgrounds the work if it has a Celery
+queue configured (otherwise it runs inline and answers 200, so 202 means
+"poll GET /tasks/<id>" and 200 means "already done"), and on that inline
+path a conflict comes back as HTTP 500 rather than 400, because run_task()
+catches process_transactions()'s ValueError and re-aborts it (see
+gramps_webapi/api/tasks.py). Both 400 and 500 are therefore checked for
+the "Object has changed" sentinel, and a failed background task is
+inspected for it too -- otherwise a conflict on that path would read as a
+transient server error and be queued for retry forever.
+
+The mirror stays current while the tree is open, not just at load() time:
+load() also schedules a GLib.timeout_add_seconds() tick (POLL_INTERVAL_SECONDS)
+that re-runs _sync_from_server_async() for as long as the database stays
+open -- the same id-cursor poll gramps-connect's browser client uses against
+this same endpoint (see gramps-connect's store/historyPoll.ts), so a change
+made from any other client shows up here without closing and reopening the
+tree. The cursor (sync_last_id) is a transaction id, not a timestamp -- see
+get_transaction_history()'s own docstring on why cursoring on the older,
+float timestamp-based ``after`` param risked an infinite-redelivery loop,
+and _migrate_sync_cursor_to_id() for how an existing mirror's old
+timestamp cursor is upgraded, once, the first sync after this addon
+switched. Its network legs run on a worker thread (see "Keeping the GUI
+alive" below), so a poll's round trip no longer costs the window a UI
+pause the way it once did. close() cancels the pending timeout so a
+closed database doesn't keep polling.
+
+A server that stops answering does not interrupt the session: the poll
+reports the outage once, backs off towards POLL_BACKOFF_MAX_SECONDS while
+it lasts, and picks the mirror up again from the persisted sync cursor on
+the first tick that succeeds -- meanwhile local edits go on working
+against the mirror and queue for push (see _queue_pending_push()). See
+_poll_tick() and _record_poll_failure().
+
+The poll also backs off, independently of any outage, once this
+particular tree has gone POLL_IDLE_THRESHOLD_SECONDS with no local
+activity -- widening to POLL_IDLE_INTERVAL_SECONDS instead of the errorless
+POLL_INTERVAL_SECONDS an otherwise-healthy poll would use. "Activity" is
+any local self.dbapi read or write that isn't this addon replaying the
+server's own changes onto itself (_wrap_dbapi_execute()), so it snaps
+back the moment anyone browses or edits again, and the still-running poll
+picks up whatever changed elsewhere the next time it fires. This has
+nothing to do with GTK window focus or visibility -- this DATABASE plugin
+has no window to ask (see "Keeping the GUI alive" below) -- so a window
+that is focused but simply being read, with no clicks, backs off exactly
+like one that is minimized. See _on_poll_success().
+
+Keeping the GUI alive
+---------------------
+Every network round trip this addon makes runs on a worker thread
+(taskrunner.py's IoRunner), never on the GTK main thread -- so nothing here
+can hold the window unresponsive the way blocking network I/O on the main
+thread would, and there is nothing to interleave with the main loop's own
+event processing while a sync, push, or resync is in flight. Everything
+that touches self.dbapi (a commit, a DbTxn, importData()'s reimport) stays
+on the main thread instead, dispatched via GLibTaskRunner -- the sqlite
+backend binds a connection to its creating thread, so a DB step can never
+run anywhere else. Each such step is written as one method call that
+starts, runs to completion, and returns, with the *next* step (on either
+runner) scheduled only once it has -- see _push_payload_async(),
+_full_resync_async(), _sync_from_server_async()/_sync_page(), and
+_sync_media_files_async() for the actual chains.
+
+This wasn't always true: earlier versions of this addon ran all of that
+network work synchronously on the GTK main thread and periodically called
+_pump_main_loop() (still present, now with exactly one caller --
+_run_async_to_completion(), see below) to hand the loop back its turn
+mid-operation, the same tactic viewmanager.py's own autobackup timer uses.
+That reentrancy caused two separate crashes in the field: switching Family
+Trees while a pump-driven sync was suspended mid-operation resumed against
+an already-closed self.dbapi (sqlite3.ProgrammingError), and a HandleError
+raised by an unrelated view's redraw, dispatched from a pending GTK
+callback during a pump, propagated straight up through an otherwise-
+successful WebApiPushConflict recovery and crashed the whole application.
+Both are structurally impossible now: there is no reentrant pump inside
+any of the chains above for another GTK event to interleave with, and
+close() can only ever run strictly before or strictly after one of these
+main-thread steps, never during one.
+
+A callback scheduled on a worker thread can still find, by the time it's
+delivered back to the main thread, that close() ran while it was in
+flight -- switching Family Trees or quitting Gramps is a perfectly
+ordinary GTK event, unrelated to whatever network call happens to be
+outstanding. self._run_id, a generation counter close() bumps before
+anything else it does, and self._guarded() (a decorator-like wrapper
+applied to a step's on_success/on_error before handing it to a runner)
+together replace what _DatabaseClosed/_guarded_pump()/self._closed used to
+do for the old pump-based reentrancy: a self._guarded()-wrapped callback
+whose captured run_id no longer matches self._run_id is silently dropped
+rather than run, instead of raising an exception for some caller further
+up a call stack to catch. Some DB-touching steps (_full_resync_async()'s
+rebuild(), _after_conflict_resync()'s run_retry()) go further and re-check
+self._run_id themselves as their very first action, before touching
+self.dbapi at all -- needed wherever a step is scheduled from inside a
+callback that already ran (so self._guarded() has already let it through
+once) rather than scheduled directly by the top-level caller that claimed
+self._syncing; see either method's own comments for the narrow scheduling
+gap this closes.
+
+self._syncing is the single-flight gate stopping two such chains from
+running concurrently and landing overlapping DB-apply callbacks against
+the same local mirror: the true top-level entry point for a given
+operation (_start_push(), _poll_tick(), _media_poll_tick(), load()'s
+wait-adapter) claims it before anything touches the network, and only
+_finish_async_op() -- wrapping that operation's real completion, including
+any conflict-recovery detour a push takes through a full resync and retry
+-- releases it, once the whole chain has actually finished, not merely
+started. A push arriving while self._syncing is already held is queued
+(_queue_pending_push()) rather than raced against whatever is in flight;
+_finish_async_op() attempts one flush of that queue before releasing the
+flag, so a deferred push goes out as soon as the chain that pre-empted it
+finishes rather than waiting for the next poll tick.
+
+load() is the one entry point that still needs a synchronous answer:
+Gramps core's own DbGeneric.load() contract requires the tree to be ready
+by the time it returns, unlike every other entry point in this file, which
+starts a chain and returns immediately. _run_async_to_completion() bridges
+that gap -- the *only* remaining caller of _guarded_pump()/
+_pump_main_loop() -- by driving one of the async chains above to
+completion synchronously: pumping the main loop (so the worker-thread
+dispatch that chain depends on can actually be delivered), but never
+touching self.dbapi itself while doing so, and never reentering any of
+this addon's own DB-touching steps. See that method's own docstring.
+
+Tracing a session
+-----------------
+Most of what this addon does is invisible from the Gramps UI: a sync that
+finds nothing, a push that succeeded, a mirror quietly short of the
+server. Both this module and webapi_client.py log to ".grampswebapidb",
+so::
+
+    gramps -d .grampswebapidb
+
+turns on a DEBUG trace of exactly that (argparser.py's -d hands the name
+to logging.getLogger().setLevel()). It is deliberately per-operation
+rather than per-object: one line per HTTP request (method, path, status,
+round-trip time -- WebApiHandler._open()), one per sync page and one per
+sync (changes applied/skipped, cursor, elapsed), plus load, push, queue
+depth, media transfer counts, and the local-vs-server totals compared at
+load. Nothing logs object data or credentials, and replaying a busy feed
+costs a fixed handful of lines rather than one per change.
+
+A second, independent timeout (MEDIA_POLL_INTERVAL_SECONDS, coarser than
+POLL_INTERVAL_SECONDS) drives _sync_media_files_async(): downloading media files
+that exist as Media-object records in the mirror but not on local disk,
+and uploading local media files the server doesn't have yet. This is
+ported from GrampsWebSync's own media-file-sync step (grampswebsync.py's
+file_confirmation/file_progress wizard pages, webapihandler.py's
+get_missing_files()/download_media_file()/upload_media_file() -- same
+repo, same license, credit David Straub), but runs unattended on its own
+timer here instead of as an explicit user-driven wizard step with its own
+progress UI. It is a separate, coarser timer rather than piggybacking on
+_poll_tick() because, unlike the record-history feed, there is no cheap
+"what changed since last time" signal for file presence -- every pass
+re-checks every local Media object's file with os.path.exists() and
+re-asks the server's own GET /media/?filemissing=1 endpoint, and anything
+found missing is then transferred in full.
+
+_sync_from_server_async()'s replay runs inside a batch=True DbTxn deliberately
+(see the write-through section below for why), but that has a side effect
+beyond suppressing trans.add(): DBAPI.transaction_commit() only emits its
+person-add/family-update/event-delete/... signals `if not transaction.batch`
+(see dbapi.py), so a batch replay is otherwise invisible to every
+already-open GTK view -- the local mirror would update on disk with nothing
+on screen changing. _emit_change_signals() reproduces just that signal half
+by hand, once per synced page, using the exact same
+KEY_TO_NAME_MAP[key] + {"add"/"update"/"delete"} signal names DBAPI itself
+emits for a normal (non-batch) local edit -- so every view refreshes exactly
+the way it already knows how to for a local change, with no new view-side
+code needed. Collapsed to one signal per (obj_class, handle) -- the net
+effect across everything applied in that page, so e.g. an update
+immediately followed by a delete of the same object only fires the delete
+signal, not both.
+
+A _full_resync_async() (see below) is the one path that doesn't go through
+_emit_change_signals(): a full wipe-and-reimport is exactly the "too much
+changed to describe incrementally" case DbGeneric's own request_rebuild()
+exists for (it emits a single <type>-rebuild signal per object type,
+telling every view to reload wholesale rather than replay a specific
+add/update/delete) -- so _full_resync_async() calls that once after a successful
+reimport instead.
+
+Undo/redo integration hooks undo()/redo() the same way transaction_commit()
+hooks commits: Gramps core's own DbGenericUndo._undo()/_redo()
+(gramps/gen/db/generic.py) revert the local mirror directly via low-level
+_txn_begin()/undo_data()/_txn_commit() calls that never go through
+transaction_commit(), so without this override a local Undo/Redo would
+silently desync the server -- worse than a push conflict, since nothing
+would even be logged. The fix reuses transaction_to_json() on the DbTxn
+DbGenericUndo already stores in its undo/redo queues (the same object
+transaction_commit() turned into a payload the first time), then pushes
+it again: undo() sends it to POST /transactions/?undo=1, where the server
+reverses it itself (swaps old/new, add<->delete -- see
+gramps_webapi/api/resources/util.py's reverse_transaction()); redo() just
+pushes the original forward payload again, no different from a fresh
+commit. Both go through the same conflict-detection/resync path as a
+normal commit. Gramps' own undo history is in-memory/per-session, not
+persisted, so this only ever matters within a single running session.
+"""
+
+import inspect
+import json
+import logging
+import os
+import re
+import unicodedata
+from copy import deepcopy
+from tempfile import NamedTemporaryFile
+from time import monotonic
+from urllib.error import HTTPError, URLError
+
+from gi.repository import GLib
+
+from gramps.gen.config import config
+from gramps.gen.const import GRAMPS_LOCALE as glocale
+from gramps.gen.constfunc import has_display
+from gramps.gen.db import DbTxn
+from gramps.gen.db.dbconst import (
+    CLASS_TO_KEY_MAP,
+    DBMODE_W,
+    KEY_TO_CLASS_MAP,
+    KEY_TO_NAME_MAP,
+    TAG_KEY,
+    TXNADD,
+    TXNDEL,
+    TXNUPD,
+)
+from gramps.gen.db.exceptions import DbConnectionError, DbWriteFailure
+from gramps.gen.display.name import displayer as name_displayer
+from gramps.gen.errors import HandleError
+from gramps.gen.lib import Note, NoteType, Researcher, Tag
+from gramps.gen.lib.baseobj import BaseObject
+from gramps.gen.lib.json_utils import data_to_object, object_to_dict, remove_object
+from gramps.gen.merge.diff import diff_items
+from gramps.gen.user import User
+from gramps.gen.utils.file import media_path_full
+from gramps.gen.utils.id import create_id
+from gramps.plugins.db.dbapi.sqlite import SQLite
+from gramps.plugins.importer.importxml import importData
+
+from taskrunner import GLibTaskRunner, IoRunner
+from webapi_client import (
+    HISTORY_ID_CURSOR_MIN_API_VERSION,
+    WebApiHandler,
+    WebApiPushConflict,
+    parse_version,
+)
+
+try:
+    _trans = glocale.get_addon_translator(__file__)
+except ValueError:
+    _trans = glocale.translation
+_ = _trans.gettext
+LOG = logging.getLogger(".grampswebapidb")
+
+#: How many transactions to request per page while syncing.
+SYNC_PAGE_SIZE = 100
+
+#: How often (seconds) load() re-polls the server for as long as the
+#: database stays open -- see the module docstring's note on why this runs
+#: synchronously on the GTK main thread rather than a background timer.
+POLL_INTERVAL_SECONDS = 10
+
+#: How long (seconds) since the last local self.dbapi touch -- any read
+#: or write, see _wrap_dbapi_execute() -- before _on_poll_success() treats
+#: this tree as idle and widens the record poll to
+#: POLL_IDLE_INTERVAL_SECONDS. A proxy for "nobody is actually looking at
+#: this Gramps window right now" (minimized, backgrounded, or just left
+#: open and unused) that needs no Gtk window-focus dependency -- see the
+#: module docstring on why this DATABASE plugin avoids one. The trade:
+#: a window that's focused but passively being read (no clicks, so no
+#: db access) looks the same as one that's minimized, and backs off the
+#: same way. Comfortably longer than an ordinary pause between clicks so
+#: routine browsing doesn't flap between the two intervals.
+POLL_IDLE_THRESHOLD_SECONDS = 180
+
+#: The record poll's interval once POLL_IDLE_THRESHOLD_SECONDS of local
+#: inactivity has passed. Any local dbapi touch snaps the very next tick
+#: back down to POLL_INTERVAL_SECONDS -- see _on_poll_success(). Smaller
+#: than POLL_BACKOFF_MAX_SECONDS and chosen independently of it: idling is
+#: not an outage, and there is no reason to let the two share a policy.
+POLL_IDLE_INTERVAL_SECONDS = 60
+
+#: How often (seconds) load() and the ongoing poll re-scan for media files
+#: missing locally or on the server -- see _sync_media_files(). Coarser
+#: than POLL_INTERVAL_SECONDS: unlike a record-history page fetch, a scan
+#: touches every local Media object's file on disk (os.path.exists()) and
+#: hits a separate server endpoint, and anything found missing is then
+#: transferred in full -- not worth doing on every 10-second record-sync
+#: tick.
+MEDIA_POLL_INTERVAL_SECONDS = 300
+
+#: How often (seconds) the ongoing poll also asks _sync_from_server_async()
+#: for a totals check (verify_totals=True) -- the same mirror-completeness
+#: safety net load() always runs (see _mirror_is_short_of_the_server_async()),
+#: just far less often here: every 10-second tick would mean an extra
+#: GET /metadata/ request forever, for a blind spot (a server populated
+#: out-of-band -- a restored dump, a truncated history table -- with no
+#: transaction trail to describe it) that only matters if it happens while
+#: a tree is already open; load() already covers every other case, since
+#: it always runs one. _poll_tick() derives how many ticks that is from
+#: POLL_INTERVAL_SECONDS, so this stays an hour in wall-clock terms even
+#: if that changes.
+VERIFY_TOTALS_POLL_INTERVAL_SECONDS = 3600
+
+#: Ceiling (seconds) on the record poll's backoff while the server is
+#: unreachable -- see _poll_tick(). Every consecutive failure doubles the
+#: interval from POLL_INTERVAL_SECONDS up to this cap, and the first
+#: success resets it. A server that is down (or a laptop that is off the
+#: network) stays down for minutes or hours, not seconds, and each futile
+#: tick costs a blocking round trip on the GTK main thread -- including
+#: webapi_client's own one-shot retry sleep -- so retrying every 10
+#: seconds for the whole outage buys nothing and stutters the UI. The cap
+#: is deliberately no larger than MEDIA_POLL_INTERVAL_SECONDS: once the
+#: server comes back, the mirror should catch up within a poll or two,
+#: not stay stale for an hour.
+POLL_BACKOFF_MAX_SECONDS = 300
+
+#: Cap on the persisted pending-push queue (see _queue_pending_push()).
+#: A queue this long means the server has been unreachable across a great
+#: many local edits; keeping every one of them forever would grow the
+#: metadata row without bound, so the oldest are dropped with a loud log
+#: rather than silently.
+MAX_PENDING_PUSHES = 1000
+
+#: Tag names gramps-connect's own message-note convention uses to mark a
+#: Note as a reviewable message rather than an ordinary research note (see
+#: ../gramps-connect/app/src/store/notesApi.ts's MESSAGE_TAG/TODO_OPEN_TAG).
+#: Reused as-is here -- both sides converge on the same Tag object via
+#: get_tag_from_name(), and a recorded conflict or undelivered-push
+#: notice shows up in gramps-connect's Messages view with no new
+#: client-side code needed.
+MESSAGE_TAG_NAME = "message"
+MESSAGE_TODO_OPEN_TAG_NAME = "todo-open"
+
+#: "Author" name for the "<author>: <message>" plain-text convention
+#: gramps-connect's authoredText.ts parses (see notesApi.ts). Shared by
+#: every message note this addon writes -- conflict records
+#: (_record_conflict_notes()) and undelivered-push notices
+#: (_record_undelivered_push_notes()) alike.
+MESSAGE_NOTE_AUTHOR = "GrampsWebApiDb"
+
+
+def _message_note_description():
+    """The DbTxn description _record_conflict_notes() uses -- also
+    becomes that commit's own pushed transaction "message"
+    (transaction_commit() forwards transaction.get_description()
+    through as-is; see its own comment). A function, not a module-level
+    constant, so a locale switched mid-session doesn't leave a stale
+    translation baked into later comparisons -- recomputed fresh every
+    time, same as every other translated DbTxn description in this
+    file.
+
+    _is_message_note_push() checks a push's own message against this to
+    tell whether that payload *is* a message-note commit, wherever this
+    file is about to record another undelivered-push note about a
+    payload that failed to reach the server -- so a message note that
+    itself fails to sync doesn't recursively spawn another note about
+    that failure, forever. See _record_undelivered_push_notes()'s
+    docstring.
+    """
+    return _("Record a discarded sync conflict")
+
+
+def _is_message_note_push(message):
+    """True if message (a push's own "message" field) is one this
+    addon's own message-note machinery produced -- see
+    _message_note_description()."""
+    return message == _message_note_description()
+
+
+#: Net change count at or below which _full_resync_async()/
+#: _bootstrap_full_resync() describe a reimport with granular per-object
+#: signals (_emit_change_signals(), reusing _reconcile_batch_commit()'s
+#: own before/after diff via _diff_snapshots()) instead of request_rebuild().
+#: See those methods' own comments: a resync recovering from a push
+#: conflict or repairing a mirror the history feed lost track of touches a
+#: small number of objects against an otherwise-already-correct mirror, so
+#: a precise diff is both cheap and far less disruptive than telling every
+#: view to reload wholesale -- most importantly, gui/displaystate.py's
+#: History.history_changed() only resets Active Person on an actual
+#: <type>-rebuild signal, so a small, targeted diff leaves Active Person
+#: alone unless the active object itself was one of the handles that
+#: genuinely changed. Above this threshold (a bootstrap resync against an
+#: empty mirror, or a mirror repair that's badly fallen behind), the diff
+#: itself is legitimately "everything," where one rebuild signal per type
+#: is cheaper for every view than replaying that many individual add
+#: signals -- so request_rebuild() stays the right tool there.
+GRANULAR_REBUILD_MAX_CHANGES = 500
+
+#: Server-side permission names (gramps-web-api's auth/const.py) this
+#: addon depends on, checked at load() by _check_permissions_async().
+#:
+#: ViewPrivate is required to read at all: GET /transactions/history/
+#: calls require_permissions([PERM_VIEW_PRIVATE]) outright (see
+#: gramps_webapi/api/resources/history.py), so the whole incremental sync
+#: 403s without it. It matters just as much for _full_resync()'s fallback,
+#: which fails *silently* rather than loudly instead: POST /exporters/
+#: gramps/file doesn't refuse the request, it passes
+#: view_private=has_permissions({PERM_VIEW_PRIVATE}) into the export task
+#: (exporters.py), so a caller lacking it gets a privacy-filtered export
+#: -- which _full_resync() would then import over a wiped local mirror,
+#: quietly dropping every private record from the mirror.
+_PERM_VIEW_PRIVATE = "ViewPrivate"
+
+#: POST /transactions/ requires all three of these together
+#: (transactions.py's require_permissions([PERM_ADD_OBJ, PERM_EDIT_OBJ,
+#: PERM_DEL_OBJ]) -- has_permissions() fails if *any* are missing), so
+#: write-through needs all three or no local edit can ever be pushed.
+#: PUT /media/<handle>/file additionally needs EditObject, already
+#: included here.
+_WRITE_PERMISSIONS = ("AddObject", "EditObject", "DeleteObject")
+
+#: Together: the permission set of gramps-web-api's "Editor" role, the
+#: least-privileged built-in role that can run this addon read-write.
+_REQUIRED_ROLE_NAME = "Editor"
+
+
+class _MissingWritePermissionError(DbWriteFailure):
+    """DbWriteFailure raised specifically by _missing_write_permission_
+    error() -- a distinct subclass purely so _install_quiet_popup_
+    filter()'s logging.Filter can recognize this one, already-explained,
+    expected condition and single it out from any other DbWriteFailure
+    (e.g. exportxml.py's backup-write failures), which must keep
+    reaching Gramps' generic crash dialog unchanged.
+    """
+
+
+def _notify_missing_write_permission(message):
+    """Show a calm, native dialog carrying the same explanation as the
+    DbWriteFailure _missing_write_permission_error() is about to raise.
+
+    Neither a friendlier exception message nor a custom dialog title can
+    change what Gramps' own top-level crash dialog says -- ErrorView
+    (gui/logger/_errorview.py) hardcodes "Gramps has experienced an
+    unexpected error" and "it would be advisable to restart Gramps
+    immediately" regardless of exception type or message, which is
+    needlessly alarming for something as ordinary and recoverable as a
+    read-only account attempting an edit. This dialog is the actually
+    useful one; _install_quiet_popup_filter() (below) keeps the alarming
+    one from also popping up right after it. has_display()-gated the
+    same best-effort way _notify_fatal_poll_error() already is, since
+    this DATABASE plugin must stay importable and usable without a
+    display (CLI use) or gi/Gtk installed at all -- headless just skips
+    the dialog, same as _notify_fatal_poll_error().
+    """
+    if not has_display():
+        return
+    try:
+        from gramps.gui.user import User as GuiUser
+    except ImportError:
+        return
+    GuiUser().notify_error(_("Can't save this change"), message)
+
+
+def _install_quiet_popup_filter():
+    """Add a logging.Filter to the root logger's GtkHandler, if one is
+    attached, so that a _MissingWritePermissionError reaching Gramps'
+    top-level sys.excepthook (grampsapp.py's exc_hook, which LOG.error()s
+    every uncaught exception unconditionally -- there is no narrower
+    extension point in Gramps core to hook instead) still gets its full
+    traceback recorded to the log file/console exactly as any other
+    uncaught exception would, but does not also trigger GtkHandler's own
+    modal "Gramps has experienced an unexpected error" popup on top of
+    the calmer, already-shown _notify_missing_write_permission() dialog.
+    Filtering on the log record (rather than wrapping sys.excepthook
+    itself) leaves grampsapp.exc_hook's own special-casing (Ctrl-C,
+    IOError, HandleError's runcheck flag) completely untouched, and
+    affects only this one exception subclass -- any other DbWriteFailure,
+    or any other exception at all, still pops the generic dialog exactly
+    as before.
+
+    Idempotent (checked via the filter instance's class, not identity)
+    and a no-op wherever GtkHandler isn't attached at all: no display
+    (has_display() gates the import, same reasoning as
+    _notify_missing_write_permission()), a CLI session, or simply not
+    having reached gui.grampsgui.py's do_startup() yet.
+    """
+    if not has_display():
+        return
+    try:
+        from gramps.gui.logger import GtkHandler
+    except ImportError:
+        return
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, GtkHandler) and not any(
+            isinstance(f, _QuietMissingWritePermissionFilter) for f in handler.filters
+        ):
+            handler.addFilter(_QuietMissingWritePermissionFilter())
+
+
+class _QuietMissingWritePermissionFilter(logging.Filter):
+    """See _install_quiet_popup_filter()."""
+
+    def filter(self, record):
+        exc_info = record.exc_info
+        return not (exc_info and isinstance(exc_info[1], _MissingWritePermissionError))
+
+
+def _missing_write_permission_error(missing_write_permissions):
+    """Build the DbWriteFailure raised by transaction_commit()/undo()/
+    redo() when self._missing_write_permissions (set once, at load(), by
+    _check_permissions_async()) says this account cannot push edits at
+    all -- see transaction_commit()'s own docstring for why that check
+    can reject *before* anything commits locally instead of only after a
+    doomed push comes back 403.
+
+    Also shows the user a calm explanation immediately, via
+    _notify_missing_write_permission(), and makes sure Gramps' own
+    generic crash dialog won't pop up right after it, via
+    _install_quiet_popup_filter() -- see both for why. The raised
+    exception itself is still required: nothing in Gramps core catches
+    this exception type around an ordinary editor's own DbTxn, but that
+    propagation is exactly what stops the editor from treating the save
+    as having succeeded (e.g. closing itself and discarding the reason
+    why), so it has to keep happening even though the user has already
+    been told what went wrong by the time it does.
+    """
+    message = _(
+        "This local edit was not saved: the account authenticating "
+        "via GRAMPS_WEB_API_KEY is missing server permission(s) "
+        "needed to push changes to this Family Tree: %(missing)s. "
+        'Grant it the "%(role)s" role on the server (or ask an '
+        "administrator to) to enable editing."
+    ) % {
+        "missing": ", ".join(missing_write_permissions),
+        "role": _REQUIRED_ROLE_NAME,
+    }
+    _install_quiet_popup_filter()
+    _notify_missing_write_permission(message)
+    return _MissingWritePermissionError(message)
+
+
+#: Oldest Gramps version a *server* can run and still produce the
+#: "_class"-tagged transaction-history serialization data_to_object()
+#: understands -- see the module docstring's note on gramps52 servers.
+#: Checked at load() by _check_server_version_async() so an incompatible server
+#: says so, instead of failing later as a bare KeyError mid-sync.
+MIN_SERVER_GRAMPS_VERSION = (6, 0)
+
+#: Payload size (number of change entries) at or above which a push is
+#: sent with ?background=1 where the server supports it -- see
+#: _push_payload(). Small pushes stay synchronous: that is the
+#: overwhelmingly common case (one interactive edit), it keeps the crisp
+#: 400-means-conflict semantics, and it avoids a pointless extra
+#: round trip to the task endpoint. The threshold exists for the genuinely
+#: large payload -- above all the one _reconcile_batch_commit() builds
+#: after a bulk import -- where server-side processing can plausibly
+#: outlast webapi_client.TIMEOUT and the connection would drop mid-write.
+BACKGROUND_PUSH_THRESHOLD = 100
+
+#: Failure modes from WebApiHandler.from_env()/push_transaction(): a
+#: malformed/missing key (ValueError), a bad server response shape
+#: (KeyError/JSONDecodeError, the latter a ValueError subclass), or the
+#: server being unreachable (HTTPError/URLError/OSError -- socket.timeout
+#: is an OSError subclass).
+_CONNECTION_ERRORS = (ValueError, KeyError, HTTPError, URLError, OSError)
+
+
+class _DatabaseClosed(Exception):
+    """Raised by WebApiDB._guarded_pump() when close() ran while a
+    pump-driven sync/push was suspended -- see the module docstring's
+    "Keeping the GUI alive" section. Deliberately not one of the
+    _CONNECTION_ERRORS: it isn't a connectivity problem, and turning it
+    into a DbConnectionError would show the user a scary message about a
+    tree they've already left."""
+
+
+def _pump_main_loop():
+    """Dispatch the main loop's next source, blocking until one is ready
+    rather than busy-spinning.
+
+    _run_async_to_completion()'s own wait loop calls this over and over
+    until the chain it's waiting on finishes. An earlier version of this
+    function checked context.pending() and looped calling
+    context.iteration(False) only while something was already queued --
+    which means, the instant nothing is pending (the common case while
+    waiting on a worker thread doing real I/O), that outer wait loop
+    spun as fast as Python and the GIL would allow, pinning a CPU core
+    for the whole wait. Confirmed live (2026-08-17) that this made both
+    the window's own responsiveness and the actual worker-thread transfer
+    it was waiting on noticeably worse -- a tight Python loop reacquiring
+    the GIL on every spin leaves less of it for the thread doing the
+    actual work. context.iteration(True) blocks efficiently (via the
+    platform's own poll/select under the hood) until a source is ready --
+    including the GLib.idle_add() callback a worker thread's result
+    arrives through -- then dispatches exactly that one, the same
+    at-most-one-source-per-call contract the old loop had.
+
+    Every network round trip this addon makes runs synchronously on the
+    GTK main thread (see the module docstring's polling section), so a
+    long one -- a full-export download, a page-by-page catch-up, a media
+    transfer, a backgrounded push being waited on -- is time the main
+    loop spends inside this addon rather than answering. The window
+    manager reads that as a hung application and offers to force-quit it,
+    and the window itself stops redrawing (no progress bar movement, no
+    repaint after an overlapping window moves away).
+
+    Calling this at the boundaries of those operations gives the loop its
+    turn: pending redraws, the progress bar Gramps is already driving via
+    load()'s callback, and the window manager's own ping all get handled,
+    and the application stays live.
+
+    Goes through GLib's default main context rather than Gtk.main_
+    iteration() so this module stays importable without a display: it is
+    a DATABASE plugin, loadable from the CLI, where pulling in gramps.gui
+    (or Gtk) has no business being a requirement. GTK drives that very
+    context, so the effect under the GUI is the same.
+
+    The obvious hazard of pumping a main loop mid-operation is
+    re-entrancy -- our own POLL_INTERVAL_SECONDS timeout coming round
+    while a sync is in flight. _poll_tick()/_media_poll_tick() check
+    _syncing for exactly that and skip their turn.
+
+    A second, subtler hazard: whatever pending source this dispatches --
+    a redraw, an idle callback a view scheduled off one of our own
+    request_rebuild()/commit signals, an unrelated timer -- runs
+    arbitrary code this addon does not own and cannot make correct.
+    Gramps' own Callback.emit() already treats a connected handler's
+    exception as that handler's problem (log and move on, never let it
+    abort the emit()); GLib.MainContext.iteration() has no such
+    protection built in, so left unguarded, a bug in some completely
+    unrelated bit of GUI code reached this way can propagate up through
+    this addon's sync/push machinery and take the whole application down
+    with it -- confirmed in the field as a HandleError raised from a
+    PeopleView redraw during _full_resync()'s post-reimport pump,
+    surfacing (and killing Gramps) from inside a WebApiPushConflict
+    handler that had otherwise recovered correctly. Catching and logging
+    here, matching Callback.emit()'s own posture, keeps that class of bug
+    a cosmetic GUI glitch instead of a lost edit and a crashed app.
+    """
+    context = GLib.MainContext.default()
+    try:
+        context.iteration(True)
+    except Exception:
+        LOG.exception(
+            "Unhandled exception from a GTK/GLib callback dispatched "
+            "while pumping the main loop mid-sync; continuing rather "
+            "than letting it abort the sync/push in progress."
+        )
+
+
+def _http_error_detail(err):
+    """Pull the server's own explanation out of an HTTPError's JSON body,
+    if it has one.
+
+    _get_json()/_get_binary() re-raise a non-401/429 HTTPError as-is,
+    which throws away its response body -- so a bare "HTTP Error 422:
+    Unprocessable Entity" reaches the user with no hint which request
+    parameter the server actually objected to. FastAPI's own automatic
+    validation errors (a raw 422, before the request even reaches
+    gramps-web-api's route handler) put that under "detail"; the app's
+    own domain errors (see webapi_client._raise_for_push_conflict(),
+    _task_error_message()) use {"error": {"message": ...}} instead;
+    flask-jwt-extended's own error handlers -- what actually answers a
+    rejected POST /token/refresh/ (expired, revoked, or otherwise invalid
+    refresh token) -- use a third shape, {"msg": ...}. Try all three; give
+    up quietly (None) if the body isn't JSON at all, or has already been
+    read by something else.
+    """
+    try:
+        body = json.loads(err.read())
+    except (ValueError, OSError, AttributeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    detail = body.get("detail")
+    if detail:
+        return str(detail)
+    error = body.get("error")
+    if isinstance(error, dict) and error.get("message"):
+        return str(error["message"])
+    msg = body.get("msg")
+    if msg:
+        return str(msg)
+    return None
+
+
+def _wrap_progress_callback(callback, text):
+    """Adapt a Gramps load()-progress callback (a plain percentage
+    function, 0-100) to also carry a descriptive label, for callers that
+    accept one: gui/dbloader.py's uistate.pulse_progressbar(value,
+    text=None) shows it as "<text>: NN%" on the progress bar dbloader.py
+    already displays for the duration of any db.load() call, turning
+    that otherwise-blank bar into a real "Syncing with Gramps Web API..."
+    indicator during the initial catch-up sync. cli/grampscli.py's own
+    callback, _pulse_progress(value), takes only the one positional
+    argument -- calling it with a second would raise TypeError -- so the
+    signature is inspected once, here, rather than assumed.
+
+    Returns ``callback`` unchanged if it is None or doesn't accept a
+    second argument.
+    """
+    if callback is None:
+        return None
+    try:
+        accepts_text = len(inspect.signature(callback).parameters) >= 2
+    except (TypeError, ValueError):
+        # Some callables (a bound method of a C extension type, a
+        # functools.partial with no introspectable signature, ...) can't
+        # be inspected at all -- safest default is the plain percent-only
+        # call every caller is guaranteed to accept.
+        accepts_text = False
+    if not accepts_text:
+        return callback
+    return lambda value: callback(value, text)
+
+
+def _import_progress_user(callback):
+    """Build the User importData() should see for _full_resync_async()'s
+    reimport, using exactly the class and wiring Gramps' own GUI import
+    uses -- gui/dbloader.py's DbLoader.do_import():
+    ``User(callback=self._pulse_progress, ...)`` -- confirmed, by testing
+    it directly against the same large export this addon's own reimport
+    was previously freezing on with no progress at all, to report real
+    progress throughout a large import without hanging or crashing
+    Gramps.
+
+    uistate/dbstate/parent are intentionally omitted: ImportXml's
+    GrampsParser never calls begin_progress()/step_progress()/
+    end_progress() (only self.update() -> UpdateCallback ->
+    user.callback(), see gen/updatecallback.py) -- so the ProgressMeter
+    dialog those three would drive, the only thing that would need a
+    parent window, is never triggered either way. Only UserBase.callback()
+    (inherited unchanged) matters here, and that just calls
+    callback(percentage[, text]).
+
+    Falls back to the inert gramps.gen.user.User if there's no display
+    (CLI use) or gi/Gtk aren't importable -- gui.user.User pulls in Gtk at
+    import time, which this DATABASE plugin must stay usable without.
+    """
+    if has_display():
+        try:
+            from gramps.gui.user import User as GuiUser
+
+            return GuiUser(callback=callback)
+        except ImportError:
+            pass
+    return User(callback=callback)
+
+
+def _describe_connection_error(err):
+    """
+    Turn a _CONNECTION_ERRORS exception into DbConnectionError's message
+    body. A 403 means the account GRAMPS_WEB_API_KEY authenticates as was
+    correctly identified but isn't allowed to do this -- worth calling out
+    specifically, since the raw HTTPError text ("HTTP Error 403:
+    Forbidden") reads like an auth failure rather than a permissions one.
+
+    Anything else that came with a JSON body (see _http_error_detail())
+    gets that appended, so a validation failure like a bare 422 names the
+    field it rejected instead of just its status code.
+
+    URLError.__str__() wraps its reason in literal angle brackets --
+    "<urlopen error [Errno 111] Connection refused>" -- which Gramps'
+    own dialog code renders as Pango markup: the "<urlopen ...>" reads
+    as an unclosed tag, so the markup parser rejects the whole string
+    and the user sees a GTK warning in the log instead of the actual
+    error message. Using err.reason directly avoids ever producing that
+    wrapper.
+    """
+    if isinstance(err, HTTPError) and err.code == 403:
+        return _(
+            "The account authenticating via GRAMPS_WEB_API_KEY does not "
+            "have permission on the server for this operation (HTTP 403 "
+            "Forbidden). Generate a key for an account with sufficient "
+            "permissions, or ask the server administrator to grant this "
+            "one access."
+        )
+    if isinstance(err, HTTPError):
+        detail = _http_error_detail(err)
+        if detail:
+            return "%s\n\n%s" % (err, detail)
+        return str(err)
+    if isinstance(err, URLError):
+        # HTTPError is itself a URLError subclass, so this branch is only
+        # reached for a "real" URLError (DNS failure, connection refused,
+        # ...) -- an HTTPError always returns above, one way or the other.
+        return str(err.reason)
+    return str(err)
+
+
+def _is_retryable_push_error(err):
+    """Whether a failed request is worth retrying -- named for its
+    original use (a failed push, see _push_payload_async()) but equally
+    applicable to a failed poll read (_on_poll_error()/
+    _on_media_poll_error()): the same 4xx-is-a-considered-answer logic
+    holds regardless of which kind of request it was.
+
+    A 4xx is the server's considered answer about *this* request -- 403
+    (the account lacks AddObject/EditObject/DeleteObject; see
+    _check_permissions_async() -- or, on a poll's read path, ViewPrivate,
+    or the account behind GRAMPS_WEB_API_KEY no longer existing at all,
+    e.g. the server having been reset), 404, or a 400 that
+    push_transaction() already determined isn't a conflict -- and will
+    keep being the answer no matter how often it is replayed. Retrying
+    one forever would just repeat the same rejection on every poll (and,
+    for a push, eventually evict genuinely retryable work from the
+    capped queue).
+
+    429 is the exception: it is explicitly "try again shortly", not a
+    refusal. Everything else (5xx, URLError, socket timeout, a malformed
+    response) is transient or unknown, and gets the benefit of the doubt.
+    """
+    if isinstance(err, HTTPError):
+        return err.code == 429 or not 400 <= err.code < 500
+    return True
+
+
+def _notify_fatal_poll_error(detail):
+    """Show a native error dialog for _give_up_polling() -- the GUI
+    equivalent of load()'s own DbConnectionError path, reached directly
+    instead of by raising: a poll tick fires long after load() has
+    already returned, so there is no load() call left for a raised
+    exception to propagate out of and no dbstate/viewmanager code
+    waiting to catch one.
+
+    gramps.gui.user.User.notify_db_error() drives the same DBErrorDialog
+    load()'s own DbConnectionError shows -- imported the same has_display()-
+    gated, best-effort way _import_progress_user() already does, since
+    this DATABASE plugin must stay importable and usable without a
+    display (CLI use) or gi/Gtk installed at all. Headless or import
+    failure just leaves _give_up_polling()'s own LOG.error() call as the
+    only record -- there is no dialog to show either way.
+    """
+    if not has_display():
+        return
+    try:
+        from gramps.gui.user import User as GuiUser
+    except ImportError:
+        return
+    GuiUser().notify_db_error(
+        _(
+            "GrampsWebApiDb: this Family Tree's server credentials are no "
+            "longer valid, so periodic syncing has stopped:\n\n%(detail)s\n\n"
+            "Local edits will keep working, but will not reach the server "
+            "until this tree is closed and reopened with a valid "
+            "GRAMPS_WEB_API_KEY."
+        )
+        % {"detail": detail}
+    )
+
+
+#: Same substitution gramps.gui.dbman's Family Tree Manager applies to
+#: whatever a user types renaming a tree (dbman.py's __change_name(): "kill
+#: special characters so can use as file name in backup"). A hostname-
+#: bearing name can't survive that GUI round-trip with its dots intact, so
+#: _check_identity_async() normalizes through this same substitution on both
+#: sides before comparing -- see that method.
+_FAMILY_TREE_NAME_UNSAFE_CHARS = re.compile(r"[':<>|,;=\"\[\]\.\+\*\/\?\\]")
+
+_TRANS_TYPE_NAME = {TXNADD: "add", TXNUPD: "update", TXNDEL: "delete"}
+
+#: The reverse of _TRANS_TYPE_NAME -- _diff_snapshots() emits "type" as a
+#: string (transaction_to_json()'s shape, and what _reconcile_batch_commit()
+#: pushes), but _emit_change_signals() takes TXNADD/TXNUPD/TXNDEL. Built
+#: from _TRANS_TYPE_NAME rather than duplicated by hand so the two can
+#: never drift apart.
+_NAME_TO_TRANS_TYPE = {name: code for code, name in _TRANS_TYPE_NAME.items()}
+
+#: Same signal-name suffixes DBAPI.transaction_commit() uses (dbapi.py's
+#: own `action` dict) -- see _emit_change_signals().
+_TRANS_TYPE_ACTION = {TXNADD: "-add", TXNUPD: "-update", TXNDEL: "-delete"}
+
+
+def transaction_to_json(transaction):
+    """
+    Build the flat change-list payload POST /transactions/ expects, from
+    a just-committed local DbTxn. Ported from GrampsWebSync's
+    webapihandler.transaction_to_json (same repo, same license, credit
+    David Straub) instead of imported, for the same no-cross-addon-
+    dependency reason as webapi_client.py.
+    """
+    out = []
+    for recno in transaction.get_recnos(reverse=False):
+        key, action, handle, old_data, new_data = transaction.get_record(recno)
+        obj_cls_name = KEY_TO_CLASS_MAP.get(key)
+        if obj_cls_name is None:
+            continue  # reference-type record, not a primary object
+        out.append(
+            {
+                "type": _TRANS_TYPE_NAME[action],
+                "handle": handle,
+                "_class": obj_cls_name,
+                "old": None if old_data is None else remove_object(old_data),
+                "new": None if new_data is None else remove_object(new_data),
+            }
+        )
+    return out
+
+
+#: Handle-list attributes merge() unions without any existence check --
+#: see _prune_dangling_references() below. TagBase/NoteBase/CitationBase
+#: are the only primary-object mixins that hold plain handle lists rather
+#: than reference objects of their own (EventRef, ChildRef, ... carry a
+#: handle *inside* a child object get_handle_referents() already walks
+#: to, so pruning each of these three attributes on every node
+#: _iter_referents() yields covers those too).
+_DANGLING_REFERENCE_CHECKS = (
+    ("tag_list", "has_tag_handle"),
+    ("note_list", "has_note_handle"),
+    ("citation_list", "has_citation_handle"),
+)
+
+
+def _iter_referents(obj):
+    """obj, then every child object get_handle_referents() reaches,
+    recursively -- e.g. a Person's EventRef/Attribute/MediaRef/Address
+    entries, each of which can carry its own tag_list/note_list/
+    citation_list. Same traversal BaseObject.get_referenced_handles_
+    recursively() uses, just walking nodes instead of collecting handles.
+    """
+    yield obj
+    for child in obj.get_handle_referents():
+        yield from _iter_referents(child)
+
+
+def _prune_dangling_references(obj, db, pruned=None):
+    """Strip any Tag/Note/Citation handle obj (or any nested child object
+    -- see _iter_referents()) carries that no longer resolves in db.
+
+    _merge_or_overwrite() below exists specifically to replay a *stale*
+    pre-conflict local edit on top of a freshly-resynced object
+    (_retry_after_conflict()) -- and merge()'s own list-unioning
+    (TagBase._merge_tag_list() and the Note/Citation equivalents,
+    gen/lib/{tagbase,notebase,citationbase}.py) has no existence check at
+    all. If the push conflict this retry is recovering from was itself
+    caused by another client deleting one of those Tag/Note/Citation
+    objects, resync correctly drops the reference from the freshly-
+    fetched "current" -- but the union then resurrects that now-dangling
+    handle straight into the object about to be committed. Confirmed in
+    the field (2026-08-17): the very next redraw of the affected row then
+    crashed Gramps with an uncaught HandleError (PeopleModel.
+    column_tag_color() -> db.get_tag_from_handle()), reproduced exactly
+    by replaying this same sequence against a real GTK PersonListModel.
+
+    Applied to whatever _merge_or_overwrite() is about to return, not
+    just the merge() branch's output -- the type(current).merge is
+    BaseObject.merge fallback (e.g. Tag) returns local_obj outright with
+    no merge() call at all to have caught this otherwise.
+
+    pruned, if given a list, gets one (attr, handle) tuple appended for
+    every handle actually stripped -- always a genuine two-sided
+    disagreement when it fires at all (local's edit still points at
+    something; db, reflecting the post-resync server state, says it no
+    longer exists), unlike an uncontested edit. How
+    _merge_or_overwrite() surfaces this to _retry_after_conflict() as a
+    conflict worth a message, without changing this function's own
+    in-place-mutation contract for existing callers that don't pass it.
+    """
+    for node in _iter_referents(obj):
+        for attr, has_handle_name in _DANGLING_REFERENCE_CHECKS:
+            handles = getattr(node, attr, None)
+            if not handles:
+                continue
+            has_handle = getattr(db, has_handle_name)
+            kept = []
+            for handle in handles:
+                if has_handle(handle):
+                    kept.append(handle)
+                elif pruned is not None:
+                    pruned.append((attr, handle))
+            handles[:] = kept
+
+
+def _birth_death_ref_identity(person):
+    """The (handle, role) identity -- (ref.ref, ref.role.serialize()) --
+    of whichever EventRef person's birth_ref_index/death_ref_index
+    currently points to, or None for an index that's -1 (nothing marked
+    primary) or out of range. What _restore_birth_death_indices() uses
+    to relocate the *same* ref after a resync by what it actually is,
+    not by trusting a bare integer position to still mean the same thing
+    once the list itself has changed around it -- see
+    _relocate_birth_death_index()."""
+    refs = person.get_event_ref_list()
+
+    def identity(index):
+        if index < 0 or index >= len(refs):
+            return None
+        ref = refs[index]
+        return (ref.ref, ref.role.serialize())
+
+    return identity(person.birth_ref_index), identity(person.death_ref_index)
+
+
+def _relocate_birth_death_index(event_ref_list, identity):
+    """Where identity (see _birth_death_ref_identity()) sits in
+    event_ref_list now, tolerating unrelated additions, removals, or
+    reordering elsewhere in the list -- unlike an earlier version of
+    this mechanism, which trusted a restore only if the person's whole
+    event_ref_list matched an exact pre-resync signature, forfeiting the
+    restore over any concurrent event-ref edit at all, even one entirely
+    unrelated to birth/death.
+
+    identity of None means "nothing was marked primary before" (the
+    original index was -1) -- restorable unconditionally as -1
+    regardless of what else in the list changed: birth_ref_index/
+    death_ref_index has no representation in a Gramps XML export at all
+    (see _snapshot_birth_death_indices()'s docstring), so nothing a
+    resync pulls in could ever correctly tell this addon to change its
+    own memory of this field from any other client. That memory --
+    including "nothing was marked" -- is the best available answer
+    regardless of what else about the person changed, for exactly the
+    same reason a real index is worth relocating rather than discarding
+    below.
+
+    Returns None (leave whatever ImportXml's own document-order
+    heuristic already computed alone) if identity names a specific ref
+    that is no longer present at all: unlike an unrelated list change,
+    losing the actual referenced event/role pair leaves nothing to
+    relocate to, and the freshly-recomputed guess is at least as
+    trustworthy as a now-dangling position would be.
+    """
+    if identity is None:
+        return -1
+    for position, ref in enumerate(event_ref_list):
+        if (ref.ref, ref.role.serialize()) == identity:
+            return position
+    return None
+
+
+def _snapshot_birth_death_indices(db):
+    """Capture birth_ref_index/death_ref_index -- as the specific
+    EventRef each currently identifies, not the bare integer position,
+    see _birth_death_ref_identity() -- for every Person, keyed by
+    handle, taken right before _full_resync_async()'s rebuild() clears
+    the mirror.
+
+    Gramps XML has no element for either index (confirmed against
+    exportxml.py's write_person(): only the event_ref_list itself is
+    written) -- ImportXml instead *recomputes* both, unconditionally,
+    from document order: the first PRIMARY-role BIRTH/DEATH-type event
+    ref becomes the new birth_ref_index/death_ref_index, and a Person
+    with no such ref keeps -1 (importxml.py's own GrampsParser,
+    ``self.person.get_birth_ref() is None`` guard). That recomputation
+    is wrong whenever the true index was already -1 despite a BIRTH/
+    DEATH-type ref existing (nothing marks one as "the" birth/death
+    among several, or none is marked as primary at all -- both real,
+    legal states, common on data imported from outside Gramps) or
+    pointed at something other than the first such ref (multiple
+    disputed-date events, a later one picked as authoritative). Since
+    diff_items() (gen/merge/diff.py) treats birth_ref_index/
+    death_ref_index as ordinary content -- unlike "change", there is no
+    key-name skip for them -- a Person whose true index doesn't match
+    that heuristic silently and permanently disagrees with the server
+    after every single resync, so any future edit to that Person's own
+    "old" snapshot never matches the server's current data again:
+    gramps-web-api's old_unchanged() (api/tasks.py) rejects the push,
+    _push_payload_async() resyncs (recomputing the same wrong value
+    right back), and the retry conflicts identically -- confirmed via a
+    local export/reimport round-trip against a real DBAPI database
+    (birth_ref_index went from -1, correct, to 0 purely from the XML
+    round trip, with no edit involved).
+
+    _restore_birth_death_indices() undoes the damage for whatever this
+    captured, once the reimport is done.
+    """
+    snapshot = {}
+    for handle in db.get_person_handles():
+        person = db.get_person_from_handle(handle)
+        snapshot[handle] = _birth_death_ref_identity(person)
+    return snapshot
+
+
+def _restore_birth_death_indices(db, snapshot, trans):
+    """_snapshot_birth_death_indices()'s other half -- see that
+    function's docstring and _relocate_birth_death_index()'s for how
+    each index is relocated independently, tolerating an unrelated
+    change elsewhere in the person's event_ref_list. Called under the
+    same self._pulling context _full_resync_async()'s rebuild() already
+    holds around the reimport itself, so this local-only correction does
+    not get mistaken for an edit to push back to the server (see
+    transaction_begin()'s self._pulling check). Returns the number of
+    Person objects corrected, purely for the caller's own debug log.
+    """
+    restored = 0
+    for handle, (birth_identity, death_identity) in snapshot.items():
+        if not db.has_person_handle(handle):
+            continue
+        person = db.get_person_from_handle(handle)
+        event_ref_list = person.get_event_ref_list()
+        new_birth = _relocate_birth_death_index(event_ref_list, birth_identity)
+        new_death = _relocate_birth_death_index(event_ref_list, death_identity)
+        changed = False
+        if new_birth is not None and new_birth != person.birth_ref_index:
+            person.birth_ref_index = new_birth
+            changed = True
+        if new_death is not None and new_death != person.death_ref_index:
+            person.death_ref_index = new_death
+            changed = True
+        if changed:
+            db.commit_person(person, trans)
+            restored += 1
+    return restored
+
+
+def _apply_true_birth_death_indices(db, true_indices, trans):
+    """_bootstrap_full_resync()'s counterpart to _restore_birth_death_indices():
+    correct birth_ref_index/death_ref_index against the server's own true
+    values (``true_indices``, a {handle: (birth_ref_index, death_ref_index)}
+    map from WebApiHandler.get_person_birth_death_indices()) rather than a
+    prior local snapshot.
+
+    _restore_birth_death_indices() only has something to restore *from* --
+    a mirror already holds a value worth preserving across the wipe this
+    resync just did. A brand-new bootstrap mirror has no such value (see
+    _snapshot_birth_death_indices()'s own docstring): the local snapshot
+    it captures right before the wipe is always empty, so nothing was ever
+    corrected on the very sync where ImportXml's document-order heuristic
+    is *most* likely to disagree with the truth -- confirmed live
+    (live_tests/test_live_birth_death_index_bootstrap.py) to produce a
+    wrong-forever index and a permanently false push conflict on that
+    person's very first future edit, no matter what the edit was actually
+    about (diff_items() compares the whole object, not just what changed
+    -- see the module docstring).
+
+    Ground truth instead of a carried-forward guess: for every Person
+    ImportXml just recomputed a heuristic value for, if the server's real
+    value differs, use that instead. Same self._pulling-context and
+    commit-count-return contract as _restore_birth_death_indices().
+    """
+    corrected = 0
+    for handle, (true_birth, true_death) in true_indices.items():
+        if not db.has_person_handle(handle):
+            continue
+        person = db.get_person_from_handle(handle)
+        changed = False
+        if true_birth != person.birth_ref_index:
+            person.birth_ref_index = true_birth
+            changed = True
+        if true_death != person.death_ref_index:
+            person.death_ref_index = true_death
+            changed = True
+        if changed:
+            db.commit_person(person, trans)
+            corrected += 1
+    return corrected
+
+
+def _snapshot_tag_handles_by_name(db):
+    """{tag name: handle} for every Tag in the local mirror, taken right
+    before a resync's own "clear local mirror" step -- the identity
+    _restabilize_tag_handles() tries to preserve across the reimport
+    that follows it. Empty for a genuine bootstrap (nothing local to
+    preserve yet), which makes that call a safe no-op there -- same
+    convention as _snapshot_birth_death_indices().
+
+    A plain per-handle get_tag_from_handle() loop rather than
+    _iter_raw_data()'s bulk form (contrast _normalize_reimported_text()):
+    there are normally only a handful of Tags in a whole tree, nowhere
+    near the O(handles) cost concern bulk-scanning Person/Event exists
+    to avoid.
+    """
+    return {db.get_tag_from_handle(h).get_name(): h for h in db.get_tag_handles()}
+
+
+def _restabilize_tag_handles(db, before_by_name, trans):
+    """Rewrite every reimported Tag reference back onto this mirror's
+    own previously-established handle for that same tag name, and
+    remove the now-orphaned duplicate the reimport just created.
+
+    Reported live (addons-source#1030): the exact same Tag, attached to
+    the exact same Person, with nothing about either edited, came back
+    under a different raw handle on three separate, directly-
+    consecutive resyncs within one session -- confirmed not a local
+    artifact: ImportXml.inaugurate() (gramps/plugins/importer/
+    importxml.py) always *preserves* whatever handle a Gramps XML file
+    specifies for an object already absent from the target database
+    (which every object is, right after this resync's own "clear local
+    mirror" step), the same mechanism that keeps every Person's handle
+    stable across every resync in the same logs. The only way three
+    separate exports of unchanged data produce three different handles
+    for the same Tag, with Person/Event/... all staying stable, is that
+    gramps-web-api's own export generator does not treat a Tag as a
+    persisted object with a stable handle the way Gramps core does, and
+    mints one fresh, per export, purely to produce valid Gramps XML --
+    the same category of round-trip-fidelity gap as birth_ref_index/
+    death_ref_index and "\\r\\n" line endings (see
+    _snapshot_birth_death_indices()/_normalize_reimported_text()), just
+    with no representation gap this time: the *value* itself is simply
+    not reproducible, so the fix is to keep this mirror's own previous
+    handle instead of adopting whatever the latest export happened to
+    mint. Since tag_list is a plain handle list (TagBase -- mixed in
+    only via gen/lib/primaryobj.py, confirmed no secondary/child object
+    class mixes it in directly, unlike note_list/citation_list -- see
+    _prune_dangling_references()'s own docstring on why *those* need
+    _iter_referents()'s recursion and this doesn't), every object
+    carrying the tag looks genuinely edited to diff_items() on every
+    single future resync, forever -- the same permanent, first-push,
+    no-real-editor-involved conflict shape as both of those.
+
+    Called from both _full_resync_async()'s rebuild() and
+    _bootstrap_full_resync(), right after the reimport (and after
+    _normalize_reimported_text(), though order between the two doesn't
+    matter -- neither touches the other's field), under the same
+    self._pulling context those already hold. before_by_name is
+    _snapshot_tag_handles_by_name()'s own return value, taken before the
+    "clear local mirror" step.
+
+    One pass over every non-Tag primary object (O(objects), not O(stale
+    tags) x O(objects)): a get_tag_list() lookup rather than an
+    _iter_raw_data() bulk read like _normalize_reimported_text(), since
+    unlike that method every one of TAG_KEY's siblings needs checking
+    regardless (a live object's own tag_list, not a string leaf buried
+    arbitrarily deep), so there's no cheaper raw-data shortcut available.
+
+    The old Tag object itself no longer exists to rewrite references
+    *onto* -- it was removed by this same resync's own "clear local
+    mirror" step, same as everything else. Its content (name, color,
+    priority -- whatever the reimport actually brought back) is revived
+    under the *old* handle instead of being discarded: remove_tag() the
+    reimport's own new-handle copy, re-set its handle to the old one,
+    and add_tag() it back -- the same set_handle()-then-add_* pattern
+    ImportXml.inaugurate() itself uses to place an object under a
+    caller-chosen handle rather than a freshly generated one. Leaving
+    the new copy in place under the old handle's *references* without
+    this step would trade one round-trip-fidelity bug for a worse one:
+    a Person whose tag_list points at a Tag that no longer exists at
+    all.
+
+    Returns the number of Tag objects whose handle was rewritten back.
+    """
+    rewrite = {}
+    revived = {}
+    for new_handle in list(db.get_tag_handles()):
+        tag = db.get_tag_from_handle(new_handle)
+        old_handle = before_by_name.get(tag.get_name())
+        if old_handle is not None and old_handle != new_handle:
+            rewrite[new_handle] = old_handle
+            tag.set_handle(old_handle)
+            revived[old_handle] = tag
+    if not rewrite:
+        return 0
+    for key in set(CLASS_TO_KEY_MAP.values()) - {TAG_KEY}:
+        name = KEY_TO_NAME_MAP[key]
+        for handle in list(getattr(db, f"get_{name}_handles")()):
+            obj = getattr(db, f"get_{name}_from_handle")(handle)
+            tag_list = obj.get_tag_list()
+            if not any(h in rewrite for h in tag_list):
+                continue
+            obj.set_tag_list([rewrite.get(h, h) for h in tag_list])
+            getattr(db, f"commit_{name}")(obj, trans)
+    for new_handle, old_handle in rewrite.items():
+        db.remove_tag(new_handle, trans)
+        db.add_tag(revived[old_handle], trans)
+    return len(rewrite)
+
+
+def _snapshot_researcher(db):
+    """A deep copy of this mirror's current Researcher info, taken
+    right before a resync's own "clear local mirror" step --
+    get_researcher() (DbGeneric) returns the live, mutable Researcher
+    instance ImportXml itself later overwrites in place
+    (set_researcher() -> Researcher.set_from()), so a plain reference
+    here would silently track the reimport's own overwrite instead of
+    freezing the prior value. See
+    _restore_researcher_if_locally_set()'s own docstring for why this
+    needs preserving across a reimport at all.
+
+    getattr(..., None) rather than get_researcher() (a plain ``return
+    self.owner``): unit tests construct a WebApiDB via
+    WebApiDB.__new__(), bypassing DbGeneric.__init__() (and its
+    ``self.owner = Researcher()`` default) entirely -- see
+    tests/test_grampswebapidb.py's new_instance(). Real usage always
+    has gone through __init__ by the time this runs.
+    """
+    return deepcopy(getattr(db, "owner", None) or Researcher())
+
+
+def _restore_researcher_if_locally_set(db, snapshot):
+    """Restore this mirror's own Researcher info after a reimport, if
+    the snapshot (_snapshot_researcher()'s return value, taken before
+    the "clear local mirror" step) had anything worth keeping.
+
+    ImportXml.import_researcher (gramps/plugins/importer/importxml.py)
+    is set from ``self.db.get_total() == 0`` at __init__ time -- true
+    not only for a genuine first bootstrap but for *every* resync this
+    addon ever runs, since the "clear local mirror" step always empties
+    every primary object first. Confirmed live: gramps-web-api's own
+    export always carries this demo dataset's own baked-in researcher
+    ("Alex Roitman,,,"), not this mirror's own -- so left uncorrected,
+    this field gets silently overwritten with that on every single
+    resync, not just the first, potentially within seconds of any push
+    conflict.
+
+    Researcher is never pushed to, or read as ground truth from, the
+    server by this addon at all -- pure local convenience data, the
+    same category _snapshot_birth_death_indices()'s own bootstrap case
+    has no server ground truth for either -- so this mirror's own prior
+    value, not whatever a particular export happens to carry, is what's
+    worth keeping. A blank snapshot (a genuine first bootstrap, nothing
+    ever configured for this tree) is left alone, adopting whatever the
+    reimport set instead -- same asymmetry
+    _restore_birth_death_indices()/_apply_true_birth_death_indices()
+    already have between a resync and a bootstrap.
+
+    Returns True if a restore was needed and performed, False if the
+    snapshot was blank or already matches what the reimport set.
+    """
+    blank = Researcher().serialize()
+    if snapshot.serialize() == blank:
+        return False
+    current = getattr(db, "owner", None)
+    if current is not None and current.serialize() == snapshot.serialize():
+        return False
+    db.set_researcher(snapshot)
+    return True
+
+
+def _snapshot_name_formats(db):
+    """A shallow copy of this mirror's current custom name-format
+    entries, taken right before a resync's own "clear local mirror"
+    step -- see _deduplicate_name_formats()'s own docstring for why
+    this needs preserving. Each entry is a plain (number, name,
+    fmt_str, active) tuple (immutable), so a shallow list copy is
+    enough -- no deepcopy needed here, unlike _snapshot_researcher()'s
+    live, mutable Researcher instance.
+
+    getattr(..., []) for the same WebApiDB.__new__()-bypasses-__init__()
+    reason _snapshot_researcher() guards against -- see that function's
+    own docstring.
+    """
+    return list(getattr(db, "name_formats", []))
+
+
+def _deduplicate_name_formats(db, before):
+    """Remove any name-format entry ImportXml just re-added that
+    duplicates one already present before this resync's reimport --
+    called right after the reimport, alongside this file's other
+    "correct what the reimport can't be trusted to preserve" passes.
+
+    ImportXml.parse() (gramps/plugins/importer/importxml.py) always
+    does ``self.db.name_formats += self.name_formats`` for whatever
+    <name-formats> entries the export declares, unconditionally, on
+    every single import -- not gated by whether the target database
+    was originally empty, unlike its researcher-import handling right
+    next to it (see _restore_researcher_if_locally_set()'s own
+    docstring). A colliding *number* gets remapped to a new one
+    (ImportXml.remap_name_format()) rather than treated as the same
+    entry, so a genuinely identical format -- this addon's own
+    reimported export always declares at least the one gramps-web-api
+    includes -- becomes a new, distinct entry every time. Confirmed by
+    direct reproduction: three resyncs of the same data left three
+    separate copies of "SURNAME, Given (Common)" under numbers -1, -2,
+    -3. Left uncorrected, this grows without bound for as long as the
+    mirror keeps resyncing (every push conflict, plus the periodic
+    totals-check poll), silently bloating the persisted metadata and
+    the Name Editor's own format list with an ever-growing wall of
+    visually-identical entries.
+
+    Content, not number, is this mirror's own idea of "the same
+    format" for this purpose: an entry surviving this pass is one
+    whose (name, fmt_str, active) doesn't match anything already
+    present before the reimport ran, or that was already present
+    verbatim (same number too) before it. name_displayer.
+    set_name_format() is called again with the corrected list,
+    matching ImportXml's own registration call, so the global
+    name-format registry doesn't keep a duplicate registered either.
+
+    Only prevents *further* growth from this point forward -- does not
+    retroactively collapse duplicates a resync before this fix already
+    left behind, the same conservative scope _normalize_reimported_
+    text() takes for text it hasn't already visited.
+
+    Returns the number of duplicate entries removed.
+    """
+    before_content = {(name, fmt_str, active) for _, name, fmt_str, active in before}
+    kept = []
+    removed = 0
+    for entry in getattr(db, "name_formats", []):
+        _number, name, fmt_str, active = entry
+        if entry not in before and (name, fmt_str, active) in before_content:
+            removed += 1
+            continue
+        kept.append(entry)
+    if removed:
+        db.name_formats = kept
+        name_displayer.set_name_format(db.name_formats)
+    return removed
+
+
+def _normalize_line_endings(data):
+    """Return a copy of an object_to_dict()-shaped value with every
+    string leaf's line endings collapsed to a bare "\\n", used by
+    _normalize_reimported_text() below (see TODO.md gap 9).
+
+    Deliberately *not* also normalizing Unicode form (NFC/NFD): a Gramps
+    XML export/reimport preserves it byte-for-byte, and the server keeps
+    whatever form it was given, so rewriting it locally only manufactures
+    the very mismatch it was meant to prevent -- confirmed live (TODO.md
+    gap 7, live_tests/test_live_unicode_normalization_conflict.py).
+
+    Confirmed live: a Note pushed with "\\r\\n" line endings comes back
+    "\\n"-only after a real bootstrap resync. Gramps' own exporter
+    (exportxml.py's write_text()) keeps "\\r" but writes it raw rather
+    than as "&#13;", and XML 1.0 (section 2.11) requires every parser to
+    turn a raw "\\r\\n"/"\\r" into "\\n" -- so no released Gramps export
+    can carry it, and the reimport side can't recover it.
+    """
+    if isinstance(data, dict):
+        return {key: _normalize_line_endings(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [_normalize_line_endings(item) for item in data]
+    if isinstance(data, str):
+        return data.replace("\r\n", "\n").replace("\r", "\n")
+    return data
+
+
+def _align_note_line_endings_with_server(payload, get_note_text):
+    """Return ``payload`` with each Note update/delete's "old" text
+    replaced by the server's own, when the two differ only in line
+    endings (TODO.md gap 9): a reimport always leaves the mirror's copy
+    "\\n"-only, while the server keeps whatever it was given, so an
+    "old" built from the mirror never matches a "\\r\\n"-stored Note and
+    old_unchanged() rejects every edit to it -- confirmed live
+    (live_tests/test_live_crlf_note_edit_conflict.py). "new" is left
+    alone, so the edit itself also rewrites the server's copy to "\\n".
+
+    Only multi-line text is checked (a Note with no "\\n" locally can't
+    have had one collapsed), so ordinary pushes cost no extra request.
+    Runs on io_runner (``get_note_text`` is a network call).
+    """
+    aligned = []
+    for entry in payload:
+        old = entry.get("old")
+        if entry.get("_class") == "Note" and old is not None:
+            local = (old.get("text") or {}).get("string")
+            if local and "\n" in local:
+                server = get_note_text(entry["handle"])
+                if (
+                    server is not None
+                    and server != local
+                    and _normalize_line_endings(server) == local
+                ):
+                    entry = {
+                        **entry,
+                        "old": {**old, "text": {**old["text"], "string": server}},
+                    }
+        aligned.append(entry)
+    return aligned
+
+
+def _normalize_reimported_text(db, trans):
+    """Canonicalize every primary object's text to "\\n"-only line
+    endings right after a fresh reimport -- called from both
+    _full_resync_async()'s rebuild() and _bootstrap_full_resync(),
+    under the same self._pulling context those already hold, same
+    "correct what the reimport can't be trusted to preserve" shape as
+    _restore_birth_death_indices()/_apply_true_birth_death_indices()
+    above.
+
+    Uses db._iter_raw_data() (see _snapshot_all_objects()'s own
+    docstring) rather than a per-handle get_<type>_from_handle() fetch,
+    for the same reason it does: one bulk SELECT per object type
+    (O(types)), not O(handles) individual ones -- and it hands back the
+    same json_utils-shaped, "_object"-stripped-after-remove_object()
+    form data_to_object() needs, with no live-object round trip needed
+    first.
+
+    "\\r\\n"/"\\r" line endings -- confirmed live (see
+    _normalize_line_endings()'s own docstring): XML 1.0 itself mandates
+    every compliant parser collapse these to "\\n" in character data, so
+    this is unconditional and unavoidable on the reimport side by
+    construction (TODO.md gap 9). Unicode normalization form is left
+    alone -- the reimport preserves it, see that docstring.
+
+    diff_items() -- both this addon's own (_diff_snapshots() and the
+    merge helpers below) and gramps-web-api's own old_unchanged()
+    server-side -- compares every string leaf with plain "==", which
+    treats "\\r\\n" vs "\\n" as genuinely different text even though the
+    user never touched that field. Left uncorrected, that drift
+    survives every future resync (re-exporting/re-importing the same
+    bytes just reproduces the same form again), so the very next edit
+    to that object -- regardless of what it actually touches -- would
+    spuriously conflict, forever: exactly _push_payload_async()'s
+    resync-then-retry-conflicts-again give-up path.
+
+    O(every primary object) once per resync -- real cost, but the same
+    order of magnitude _snapshot_all_objects() already pays in the same
+    resync for its own before/after comparison, and only an object
+    whose text actually needs correcting gets a commit (most won't).
+    Returns the number of objects corrected, same convention as
+    _restore_birth_death_indices()/_apply_true_birth_death_indices().
+    """
+    corrected = 0
+    for key in set(CLASS_TO_KEY_MAP.values()):
+        name = KEY_TO_NAME_MAP[key]
+        for handle, data in db._iter_raw_data(key):
+            data = remove_object(data)
+            normalized = _normalize_line_endings(data)
+            if normalized != data:
+                getattr(db, f"commit_{name}")(data_to_object(normalized), trans)
+                corrected += 1
+    return corrected
+
+
+def _diff_snapshots(before, after):
+    """Diff two {(obj_class, handle): data} snapshots (_snapshot_all_
+    objects()'s own shape) into a transaction_to_json()-shaped change
+    list: a handle present only in ``after`` is an add ("old": None), one
+    present only in ``before`` is a delete ("new": None), and one present
+    in both is an update only if its content actually differs -- compared
+    with gramps.gen.merge.diff.diff_items(), the exact function gramps-
+    web-api's own old_unchanged() conflict check uses server-side
+    (gramps_webapi/api/tasks.py, confirmed by reading that source), so
+    "did this really change" here agrees with the server's own idea of
+    it: both ignore the object's own "change" timestamp, so a resave with
+    no other change is correctly not reported at all.
+
+    Shared by _reconcile_batch_commit() (which pushes the result to the
+    server -- a local batch=True commit's own changes need to go out) and
+    _full_resync_async()/_bootstrap_full_resync() (which only need it to
+    decide what to *tell already-open views*, via _emit_change_signals()
+    -- what was just pulled *from* the server must never be pushed back).
+    """
+    entries = []
+    for obj_class, handle in after.keys() - before.keys():
+        entries.append(
+            {
+                "type": "add",
+                "handle": handle,
+                "_class": obj_class,
+                "old": None,
+                "new": after[(obj_class, handle)],
+            }
+        )
+    for obj_class, handle in before.keys() - after.keys():
+        entries.append(
+            {
+                "type": "delete",
+                "handle": handle,
+                "_class": obj_class,
+                "old": before[(obj_class, handle)],
+                "new": None,
+            }
+        )
+    for obj_class, handle in before.keys() & after.keys():
+        old_data = before[(obj_class, handle)]
+        new_data = after[(obj_class, handle)]
+        if diff_items(obj_class, old_data, new_data):
+            entries.append(
+                {
+                    "type": "update",
+                    "handle": handle,
+                    "_class": obj_class,
+                    "old": old_data,
+                    "new": new_data,
+                }
+            )
+    return entries
+
+
+def _walk_conflict_diff(obj_class, handle, old, new, path=""):
+    """Diagnostic aid for TODO.md's open "spurious first-push conflict"
+    gap: recursively walk two object_to_dict() shapes (the same "old"
+    payload snapshot and current-object shape old_unchanged()/
+    diff_items() compare server-side) and LOG.warning() every leaf that
+    actually differs, skipping "change" the same way diff_items() does
+    so this doesn't just repeat what's already known to be ignored.
+
+    The server's 400 only ever says "Object has changed", never which
+    field -- this exists to answer that, called right after a resync has
+    brought the local mirror to the server's true current state (see
+    _log_conflict_field_diffs()), so "old" vs the now-current object is
+    exactly the disagreement that caused the conflict.
+
+    Flags a string leaf that's only unequal before NFC normalization as
+    a likely decomposed-vs-precomposed Unicode mismatch (e.g. a
+    diacritic typed through macOS's native text input as "n" + a
+    combining accent, compared against a precomposed "ń" the server
+    holds) rather than a genuine edit -- suspected but unconfirmed; see
+    TODO.md.
+    """
+    if old == new:
+        return
+    if isinstance(old, dict) and isinstance(new, dict):
+        for key in old.keys() | new.keys():
+            if key == "change":
+                continue
+            _walk_conflict_diff(
+                obj_class, handle, old.get(key), new.get(key), f"{path}.{key}"
+            )
+        return
+    if isinstance(old, list) and isinstance(new, list):
+        for i, (item_old, item_new) in enumerate(zip(old, new)):
+            _walk_conflict_diff(
+                obj_class, handle, item_old, item_new, f"{path}[{i}]"
+            )
+        if len(old) != len(new):
+            LOG.warning(
+                "conflict-diff: %s %s%s -- list length differs (%d vs %d)",
+                obj_class, handle, path, len(old), len(new),
+            )
+        return
+    if isinstance(old, str) and isinstance(new, str):
+        nfc_equal = unicodedata.normalize("NFC", old) == unicodedata.normalize(
+            "NFC", new
+        )
+        LOG.warning(
+            "conflict-diff: %s %s%s differs: %r vs %r%s",
+            obj_class,
+            handle,
+            path,
+            old,
+            new,
+            " [NFC-EQUAL -- looks like a Unicode normalization "
+            "(NFC/NFD) mismatch, not a real edit]"
+            if nfc_equal
+            else "",
+        )
+        return
+    LOG.warning(
+        "conflict-diff: %s %s%s differs: %r vs %r", obj_class, handle, path, old, new
+    )
+
+
+#: object_to_dict() keys that never represent a real field edit: "change"
+#: is a commit timestamp, "handle"/"_class" identify the object rather
+#: than describe it, and "gramps_id" is deliberately cleared on local_obj
+#: before merge() runs (see _merge_or_overwrite() below), so it always
+#: "differs" from current without representing an actual local edit.
+_DISCARD_CHECK_IGNORED_FIELDS = frozenset({"_class", "handle", "change", "gramps_id"})
+
+#: Fields a primary type's own merge() deliberately preserves through a
+#: substitute mechanism, rather than simply leaving unhandled -- applying
+#: _apply_uncontested_scalar_edits() to these would fight that mechanism
+#: instead of complementing it. Currently just Person.primary_name:
+#: Person.merge() (gramps/gen/lib/person.py) always keeps current's own
+#: primary name and demotes acquisition's into current's alternate_names
+#: instead (already unioned in by the time _apply_uncontested_scalar_
+#: edits() runs) -- current.primary_name genuinely never changes value,
+#: structurally indistinguishable from "merge() never touched this
+#: field" the way every other special-cased field is (see that
+#: function's docstring), so it has to be named here explicitly instead.
+_SCALAR_MERGE_LOCKED_FIELDS = {"Person": frozenset({"primary_name"})}
+
+#: Fields a primary type's own merge() actively resolves via real
+#: business logic when both sides genuinely disagree, rather than either
+#: leaving a plain scalar at current's unchanged value or unioning a
+#: list. Currently just Citation.confidence: Citation.merge()
+#: (gramps/gen/lib/citation.py) always takes the more cautious of the
+#: two confidence levels, via a level_priority lookup -- a real,
+#: deliberate decision between two explicit values, worth a human
+#: knowing happened even though nothing was lost (the result is one of
+#: the two original values, just not left to chance which). Checked by
+#: _actively_resolved_conflicts() the same way _SCALAR_MERGE_LOCKED_
+#: FIELDS's Person.primary_name is checked by _demoted_field_
+#: conflicts() -- both need to be named explicitly, since in each case
+#: merge() already produced a definite value, so _discarded_scalar_
+#: fields() correctly has nothing left to flag for them.
+_SCALAR_MERGE_ACTIVELY_RESOLVED_FIELDS = {"Citation": frozenset({"confidence"})}
+
+
+def _is_genuine_collision(field, old_value, current_value, local_value):
+    """True only for the one shape of disagreement with no algorithmic
+    "correct" answer: current *and* local_obj both actually touched
+    field (each differs from old_value, the payload's own pre-edit
+    snapshot -- the true 3-way merge base), landing on genuinely
+    different values. An edit only one side made is not a conflict --
+    see TODO.md's "Only do for CONFLICTS" note -- so every function in
+    this file that has to tell the two apart shares this one check.
+    """
+    return (
+        diff_items(field, old_value, local_value)
+        and diff_items(field, old_value, current_value)
+        and diff_items(field, current_value, local_value)
+    )
+
+
+def _apply_uncontested_scalar_edits(old_data, current, local_obj, merged):
+    """Layered on top of merge()'s own field-specific handling (list
+    union, privacy-OR, ...): for any *other* field -- one merge() leaves
+    at current's unchanged value, a plain scalar it has no handling for
+    at all -- apply local_obj's edit if local_obj is the only side that
+    actually touched it, relative to old_data (the payload's own
+    pre-edit snapshot, entry["old"]) -- the true 3-way merge base; see
+    _discarded_scalar_fields()'s docstring for why old_data, not
+    current, decides "touched". A field both sides touched to
+    genuinely different values is a true collision and is deliberately
+    left alone here, at current's value -- see the module docstring's
+    "silently losing the discarded value is not" paragraph;
+    _discarded_scalar_fields(), called after this, records what's still
+    left to record once this has done what it safely can.
+
+    Mutates and returns merged in place, via plain setattr()/getattr():
+    every object_to_dict() top-level key names a real property on the
+    object (confirmed against Person's "gender", Event's "date"/"place"/
+    "description"/"type", ...), so this needs no per-class field list of
+    its own -- it discovers which fields merge() already handled by
+    asking what merge() actually changed (comparing current against
+    merged), the same technique _discarded_scalar_fields() uses, with
+    one necessary exception: _SCALAR_MERGE_LOCKED_FIELDS above.
+
+    A no-op if old_data is None: a caller with no real pre-edit baseline
+    (nothing in this file calls _merge_or_overwrite() without one except
+    tests exercising it directly) gets exactly the previous whole-
+    object-scalar behavior, not a guess at what "touched" means without
+    one.
+    """
+    if old_data is None or type(current).merge is BaseObject.merge:
+        return merged
+    locked = _SCALAR_MERGE_LOCKED_FIELDS.get(type(current).__name__, frozenset())
+    current_data = object_to_dict(current)
+    local_data = object_to_dict(local_obj)
+    merged_data = object_to_dict(merged)
+    for field, local_value in local_data.items():
+        if field in _DISCARD_CHECK_IGNORED_FIELDS or field in locked:
+            continue
+        if diff_items(field, current_data.get(field), merged_data.get(field)):
+            continue  # merge() already gave this field its own handling
+        old_value = old_data.get(field)
+        if not diff_items(field, old_value, local_value):
+            continue  # local_obj never touched this field
+        current_value = current_data.get(field)
+        if _is_genuine_collision(field, old_value, current_value, local_value):
+            continue  # a true conflict -- leave it for the note, not here
+        setattr(merged, field, getattr(local_obj, field))
+    return merged
+
+
+def _merge_or_overwrite(current, local_obj, db, old_data=None, pruned=None):
+    """Combine local_obj's content into current via the object's own
+    merge() -- the same list-unioning logic behind Gramps' Merge People/
+    Family/... tools (ported from GrampsWebSync's diffhandler.py, credit
+    David Straub, same license) -- when the type actually implements it,
+    then _apply_uncontested_scalar_edits() layers a real per-field 3-way
+    merge on top for whatever merge() leaves untouched: a field only
+    local_obj touched (old_data provided) survives too, not just the
+    fields merge() itself knows how to combine.
+
+    Falls back to local_obj outright for a type (e.g. Tag) that only
+    inherits BaseObject's no-op merge(): "merging" into a no-op would
+    silently keep current's content and discard the local edit entirely,
+    which is worse than the plain overwrite this replaces.
+
+    local_obj's gramps_id is cleared before merging so merge() doesn't
+    misread it as a real second object being absorbed (which is what
+    merge() is for) and tag on a spurious "Merged Gramps ID" attribute --
+    this is the same object, edited twice, not two objects becoming one.
+
+    old_data is entry["old"] -- the payload's own pre-edit snapshot, the
+    3-way merge base _apply_uncontested_scalar_edits() needs. Optional
+    (defaults to None, a no-op there) so every existing caller that
+    doesn't have one keeps the previous whole-object-scalar behavior
+    unchanged.
+
+    db is required so the result can be checked for dangling references
+    before it's returned -- see _prune_dangling_references(). pruned, if
+    given a list, is forwarded to it to collect what got stripped -- a
+    genuine conflict in its own right (the module docstring's "silently
+    losing the discarded value is not" section covers this too).
+    """
+    if type(current).merge is BaseObject.merge:
+        result = local_obj
+    else:
+        merged = deepcopy(current)
+        local_copy = deepcopy(local_obj)
+        local_copy.gramps_id = None
+        merged.merge(local_copy)
+        _apply_uncontested_scalar_edits(old_data, current, local_obj, merged)
+        result = merged
+    _prune_dangling_references(result, db, pruned=pruned)
+    return result
+
+
+def _readable_field_value(value):
+    """Render one object_to_dict() field value as a short, human-readable
+    string for a conflict note -- not a full pretty-printer, just enough
+    for a reader to tell what the kept/discarded value actually was.
+    """
+    if value is None or value == "":
+        return "(empty)"
+    if isinstance(value, dict):
+        if "string" in value:
+            # GrampsType-shaped (EventType, NameType, ...): its own
+            # custom string if set, else the type's standard name.
+            return value["string"] or str(value.get("value", value))
+        if "dateval" in value:
+            # Date-shaped: the user's own text if they set one, else the
+            # raw (day, month, year, slash) tuple.
+            return value.get("text") or str(value["dateval"])
+        return json.dumps(value, default=str)[:80]
+    if isinstance(value, list):
+        return f"{len(value)} item(s)"
+    return str(value)[:80]
+
+
+def _discarded_scalar_fields(old_data, current, local_obj, result):
+    """Return [(field, kept, discarded), ...] for every top-level field
+    local_obj's edit actually touched (differs from old_data, the
+    payload's own pre-edit snapshot -- entry["old"], the true 3-way merge
+    base) where result -- what _merge_or_overwrite() actually committed
+    -- still matches current unchanged, i.e. that edit did not survive.
+
+    old_data, not current, is what decides whether local_obj "touched" a
+    field: current is the server's post-resync state, which can itself
+    differ from old_data on fields local_obj never edited at all --
+    Person.merge()'s privacy-OR is exactly this shape (current.private
+    can be True from someone else's edit while local_obj.private is
+    still whatever it always was), and comparing against current there
+    would misreport an untouched field as a discarded local edit.
+
+    Deliberately does not need to know which fields merge() unions versus
+    leaves at current's value (see the module docstring's conflict-
+    handling section): comparing result against current directly catches
+    either shape of "local's edit didn't make it in" -- a plain scalar
+    merge() has no special handling for, or (structurally, though not
+    expected in practice for merge()'s own list/privacy/name handling) a
+    list-valued field for some reason not reflecting local's addition.
+
+    Returns [] for a type without a real merge() (BaseObject.merge --
+    result is local_obj outright, so nothing was discarded). Skips
+    _SCALAR_MERGE_LOCKED_FIELDS: those are handled exclusively by
+    _demoted_field_conflicts() instead, which (unlike this function)
+    requires a genuine collision -- merge() demotes a locked field like
+    Person.primary_name into a substitute unconditionally, on *every*
+    conflict-retry for that type, whether or not the field itself was
+    ever actually disputed, so checking it here the same way would flag
+    a plain uncontested edit as a discarded conflict; see TODO.md's
+    "Only do for CONFLICTS" note.
+
+    Also returns [] without a real old_data, same as
+    _apply_uncontested_scalar_edits() and _demoted_field_conflicts(): a
+    caller with no genuine pre-edit baseline is always a fresh add (see
+    transaction_to_json()'s "old": None convention) being retried against
+    an object that -- since has_handle() is what routes _retry_after_
+    conflict() into this merge path at all -- already exists locally with
+    exactly local_obj's own values, from the original commit this retry
+    is replaying. Treating a missing old_data as {} used to compare every
+    field against that fictitious empty baseline instead of skipping the
+    check, so every field local_obj actually set (its own real content,
+    not an edit relative to anything) read as "touched," and then as
+    "discarded" the moment current happened to already hold the identical
+    value -- a spurious conflict note, its "kept" and "discarded" values
+    always identical, on every retried add.
+    """
+    if old_data is None:
+        return []
+    if type(current).merge is BaseObject.merge:
+        return []
+    if not isinstance(result, type(current)):
+        # Best-effort bookkeeping, not the retry's actual commit -- never
+        # raise into that path over a result shape this couldn't parse.
+        return []
+    locked = _SCALAR_MERGE_LOCKED_FIELDS.get(type(current).__name__, frozenset())
+    current_data = object_to_dict(current)
+    local_data = object_to_dict(local_obj)
+    result_data = object_to_dict(result)
+    discarded = []
+    for field, local_value in local_data.items():
+        if field in _DISCARD_CHECK_IGNORED_FIELDS or field in locked:
+            continue
+        old_value = old_data.get(field)
+        if not diff_items(field, old_value, local_value):
+            continue  # local_obj didn't actually touch this field
+        current_value = current_data.get(field)
+        result_value = result_data.get(field)
+        if diff_items(field, current_value, result_value):
+            continue  # the result does reflect a real change -- not discarded
+        discarded.append(
+            (
+                field,
+                _readable_field_value(current_value),
+                _readable_field_value(local_value),
+            )
+        )
+    return discarded
+
+
+def _demoted_field_conflicts(old_data, current, local_obj, merged):
+    """Return [(field, kept, discarded), ...] for a _SCALAR_MERGE_LOCKED_
+    FIELDS field (currently just Person.primary_name) where old_data
+    shows a genuine collision -- current *and* local_obj both actually
+    touched it, to different values (see _is_genuine_collision()).
+
+    A locked field structurally never shows as "touched" by comparing
+    current against merged the way _discarded_scalar_fields() and
+    _apply_uncontested_scalar_edits() both detect every other field's
+    handling -- merge() demotes it into a substitute field entirely
+    (e.g. Person.merge() -> alternate_names) rather than declining to
+    change it the ordinary way, so current.primary_name genuinely never
+    changes value whether or not local_obj's edit to it collided with
+    anything. Requiring a real collision here, explicitly, is what
+    keeps this from flagging an ordinary, uncontested name edit that
+    happens to land on a locked field -- see TODO.md's "Only do for
+    CONFLICTS" note; nothing is actually lost in either case (merge()
+    always preserves the demoted value as an alternate), but only a
+    genuine conflict is worth a human's attention.
+
+    Returns [] without old_data, or for a type with no locked fields.
+    """
+    if old_data is None:
+        return []
+    locked = _SCALAR_MERGE_LOCKED_FIELDS.get(type(current).__name__)
+    if not locked:
+        return []
+    old_data = old_data or {}
+    current_data = object_to_dict(current)
+    local_data = object_to_dict(local_obj)
+    conflicts = []
+    for field in locked:
+        old_value = old_data.get(field)
+        current_value = current_data.get(field)
+        local_value = local_data.get(field)
+        if not _is_genuine_collision(field, old_value, current_value, local_value):
+            continue
+        conflicts.append(
+            (
+                field,
+                _readable_field_value(current_value),
+                _readable_field_value(local_value),
+            )
+        )
+    return conflicts
+
+
+def _actively_resolved_conflicts(old_data, current, local_obj, merged):
+    """Return [(field, kept, other), ...] for a _SCALAR_MERGE_ACTIVELY_
+    RESOLVED_FIELDS field (currently just Citation.confidence) where
+    old_data shows a genuine collision -- current *and* local_obj both
+    actually touched it, to different values (see
+    _is_genuine_collision()) -- that merge()'s own business logic (the
+    level_priority rule) then resolved to a definite answer, one of the
+    two original values.
+
+    Unlike _discarded_scalar_fields(), does not require merged to still
+    match current: merge() actively reassigns one of these fields on
+    every call regardless of whether a real collision occurred, so
+    "merged differs from current" doesn't by itself mean anything --
+    only a genuine collision (checked directly here, the same way
+    _demoted_field_conflicts() has to) does. kept is whichever of
+    current/local_obj's values merge() actually kept; other is whichever
+    it didn't -- both worth showing, since a human can't otherwise tell
+    a resolved conflict happened at all.
+
+    Returns [] without old_data, or for a type with no actively-resolved
+    fields.
+    """
+    if old_data is None:
+        return []
+    fields = _SCALAR_MERGE_ACTIVELY_RESOLVED_FIELDS.get(type(current).__name__)
+    if not fields:
+        return []
+    old_data = old_data or {}
+    current_data = object_to_dict(current)
+    local_data = object_to_dict(local_obj)
+    merged_data = object_to_dict(merged)
+    conflicts = []
+    for field in fields:
+        old_value = old_data.get(field)
+        current_value = current_data.get(field)
+        local_value = local_data.get(field)
+        if not _is_genuine_collision(field, old_value, current_value, local_value):
+            continue
+        merged_value = merged_data.get(field)
+        other_value = (
+            local_value
+            if diff_items(field, merged_value, current_value)
+            else current_value
+        )
+        conflicts.append(
+            (
+                field,
+                _readable_field_value(merged_value),
+                _readable_field_value(other_value),
+            )
+        )
+    return conflicts
+
+
+def _conflict_summary_lines(old_data, current, local_obj, merged, pruned):
+    """Build the human-readable lines _record_conflict_notes() writes
+    into one Note per conflicted object. Every source here only fires
+    for a genuine two-sided disagreement -- see each function's own
+    docstring, and TODO.md's "Only do for CONFLICTS" note -- so an
+    uncontested edit, or two different items both surviving a list
+    union, never produces a line.
+
+    pruned is _merge_or_overwrite()'s own pruned list (a dangling Tag/
+    Note/Citation reference _prune_dangling_references() had to strip):
+    always a genuine conflict when non-empty -- local's edit still
+    pointed at something that db, reflecting the post-resync server
+    state, says no longer exists, a real two-sided disagreement about
+    whether that referenced object should still exist at all.
+    """
+    lines = []
+    for field, kept, discarded in _discarded_scalar_fields(
+        old_data, current, local_obj, merged
+    ):
+        lines.append(f"kept {field} ({kept}), discarded local edit ({discarded})")
+    for field, kept, discarded in _demoted_field_conflicts(
+        old_data, current, local_obj, merged
+    ):
+        lines.append(
+            f"{field} conflict: kept ({kept}); local's conflicting edit "
+            f"({discarded}) was preserved separately rather than applied directly"
+        )
+    for field, kept, other in _actively_resolved_conflicts(
+        old_data, current, local_obj, merged
+    ):
+        lines.append(
+            f"{field} conflict: automatically resolved to ({kept}) over ({other})"
+        )
+    for attr, handle in pruned:
+        lines.append(
+            f"removed a {attr} reference ({handle}) that no longer exists on the server"
+        )
+    return lines
+
+
+class WebApiDB(SQLite):
+    """
+    DBAPI backend whose local SQLite connection is a mirror of a
+    Gramps Web API server, kept in sync via the server's transaction
+    history endpoint.
+    """
+
+    #: Set around _retry_after_conflict()'s own DbTxn so the
+    #: transaction_commit() it triggers can tell _push_payload() this push
+    #: is itself a conflict retry -- see _push_payload().
+    _retrying = False
+
+    #: Set around _sync_from_server()'s own batch=True DbTxns (including
+    #: the ones _full_resync() opens) so transaction_begin() can tell them
+    #: apart from a batch=True transaction started by anything else (a
+    #: bulk import, a Tool) -- see the module docstring and
+    #: _reconcile_batch_commit().
+    _pulling = False
+
+    #: Set around _record_conflict_notes()'s own DbTxns (including the
+    #: tag-creation ones _get_or_create_tag() opens on its behalf) so
+    #: transaction_commit()'s own missing-write-permission rejection (see
+    #: its docstring) doesn't reject the very note it is itself recording
+    #: -- the addon's own bookkeeping, not a fresh local edit, and one
+    #: that must go on being allowed to commit locally regardless of
+    #: self._missing_write_permissions, the same as _pulling.
+    _recording_note = False
+
+    #: The ``conflicts`` list _record_conflict_notes() is currently
+    #: attaching, stashed here just before its own DbTxn so _start_push()
+    #: can hand it to _send_note_payload_best_effort() -- which, if this
+    #: specific note-attach push itself conflicts, uses it to resync and
+    #: reattach the note fresh exactly once, rather than giving up
+    #: immediately with the note stranded only in the local mirror. See
+    #: _send_note_payload_best_effort()'s docstring. None whenever the
+    #: current note-attach push is not eligible for that retry (a plain
+    #: send, or already itself a retry -- _record_conflict_notes()'s own
+    #: ``_retry_on_conflict=False`` call), read-and-cleared by
+    #: _start_push() the moment it's used so a later, unrelated
+    #: note-attach push started while this instance is otherwise idle
+    #: never inherits a stale value.
+    _note_retry_conflicts = None
+
+    #: Set for the duration of any async operation that owns the mirror
+    #: -- a record/media sync, or (since the move off reentrant pumping)
+    #: a push -- so a second one can't start concurrently and land an
+    #: overlapping DB-apply callback. See _start_push()/_finish_async_op().
+    _syncing = False
+
+    #: Write permission(s) (of _WRITE_PERMISSIONS) the account
+    #: authenticating via GRAMPS_WEB_API_KEY was found missing at load()'s
+    #: _check_permissions_async() -- empty for a fully-privileged account,
+    #: for a tree opened read-only (never checked), or before load() has
+    #: run its checks. When non-empty, transaction_commit()/undo()/redo()
+    #: reject a genuine local edit with it, synchronously and before
+    #: anything commits locally -- see transaction_commit()'s own
+    #: docstring. Never updated after load(): a permission revoked
+    #: mid-session is not reflected here, and still only surfaces from an
+    #: actual push's own 403 -- see _push_payload_async().
+    _missing_write_permissions = ()
+
+    #: The chain a conflict retry's nested re-push belongs to, stashed by
+    #: _after_conflict_resync() so _start_push()'s recursive
+    #: (is_retry=True) call can complete *that* chain instead of treating
+    #: the retry's own local commit as the finish line -- see both
+    #: methods' docstrings and section 2.2.1 of the refactor plan for the
+    #: premature-completion bug this exists to prevent.
+    _retry_chain_done = None
+    _retry_chain_error = None
+
+    #: Bumped by close(), before anything else it does, so a pump-driven
+    #: sync/push suspended elsewhere on the call stack can tell (via
+    #: _guarded_pump()) that the tree it was working on is gone as soon as
+    #: the main loop gives control back. Also what _guarded() (used by the
+    #: worker-thread-based ..._async() chains) compares against to drop a
+    #: callback belonging to an abandoned chain -- see that method. An
+    #: instance can be load()-ed again after close() (Gramps may reuse one
+    #: WebApiDB object across Family Trees), so this is a generation
+    #: counter rather than a boolean: each close() starts a new generation
+    #: instead of leaving a single flag that a fresh load() would have to
+    #: remember to clear.
+    _run_id = 0
+
+    #: Consecutive failed polls, per timer, and the record poll's current
+    #: interval -- the outage state _poll_tick()/_media_poll_tick() use to
+    #: log an outage once instead of once per tick, and to back the record
+    #: poll off while it lasts. Reset by the first successful sync.
+    _poll_failures = 0
+    _media_poll_failures = 0
+    _poll_interval = POLL_INTERVAL_SECONDS
+
+    #: Ticks since _poll_tick() last asked for a totals check -- see
+    #: VERIFY_TOTALS_POLL_INTERVAL_SECONDS. Reset to 0 both by load()
+    #: (fresh state for a freshly opened tree, same as the outage
+    #: counters above) and by _poll_tick() itself every time it actually
+    #: fires one.
+    _polls_since_verify_totals = 0
+
+    #: Set by _give_up_polling() the first time either poller hits a
+    #: permanently-rejected request (see that method) -- both timers
+    #: share the one credential, so a rejection on either means neither
+    #: can succeed again, and this keeps the second poller's own arrival
+    #: at the same conclusion from showing a second dialog for the same
+    #: underlying problem. Reset by load() like every other outage-state
+    #: flag above.
+    _polling_abandoned = False
+
+    #: monotonic() timestamp of the last local self.dbapi touch -- set by
+    #: _wrap_dbapi_execute() and read by _on_poll_success() to decide
+    #: between POLL_INTERVAL_SECONDS and POLL_IDLE_INTERVAL_SECONDS. 0
+    #: (i.e. "long ago") until _initialize() wraps self.dbapi, which is
+    #: also the safe default for a tree that fails to load.
+    _last_local_activity = 0
+
+    def requires_login(self):
+        # Credentials come from GRAMPS_WEB_API_KEY, not a login dialog.
+        return False
+
+    def _initialize(self, directory, username, password):
+        try:
+            self.web_client = WebApiHandler.from_env()
+        except _CONNECTION_ERRORS as err:
+            raise DbConnectionError(_describe_connection_error(err), directory) from err
+        LOG.debug("client: mirroring %s", self.web_client.url)
+
+        # runner dispatches DB/GUI-touching steps on the main loop;
+        # io_runner runs pure network I/O on a worker thread. See
+        # taskrunner.py's module docstring for why -- this is what replaces
+        # the old _pump_main_loop()/_guarded_pump() reentrancy.
+        self.runner = GLibTaskRunner()
+        self.io_runner = IoRunner()
+
+        # Local mirror: reuse SQLite's own _initialize for the on-disk
+        # cache file, then sync from the server on load().
+        super()._initialize(directory, username, password)
+        self._wrap_dbapi_execute()
+
+    def _wrap_dbapi_execute(self):
+        """Instrument self.dbapi.execute() to timestamp local DB activity
+        into self._last_local_activity, read by _on_poll_success() to
+        decide the next record-poll interval -- see
+        POLL_IDLE_THRESHOLD_SECONDS.
+
+        Every one of DBAPI's own read/write helpers (_get_raw_data(),
+        _has_handle(), commit_person(), ...) funnels through this one
+        Connection.execute() call (gramps/plugins/db/dbapi/dbapi.py),
+        which makes it the one place that catches all of them without
+        instrumenting each call site individually, or every public
+        get_*_from_handle()-style method this class inherits. Shadows
+        the bound method on this Connection *instance* only -- nothing
+        about SQLite's Connection class itself needs changing, and nothing
+        outside this addon's own self.dbapi is affected.
+
+        Skipped while self._pulling is set: that flag already marks
+        exactly the writes this addon makes on the *server's* behalf --
+        replaying incoming sync pages and reimporting a full resync (see
+        the module docstring's own note on self._pulling) -- which would
+        otherwise make an actively-shared tree with other users editing
+        it look permanently "busy" here even while this particular
+        window sits minimized and untouched, defeating the point of
+        POLL_IDLE_THRESHOLD_SECONDS entirely. Genuine local reads
+        (browsing) and writes (editing) always run with self._pulling
+        false, so they still count.
+
+        self.dbapi is only ever touched from the main thread (see the
+        module docstring's "Keeping the GUI alive" section), so this
+        needs no locking: the plain monotonic() write below can't race
+        against another one.
+        """
+        real_execute = self.dbapi.execute
+
+        def execute(*args, **kwargs):
+            if not self._pulling:
+                self._last_local_activity = monotonic()
+            return real_execute(*args, **kwargs)
+
+        self.dbapi.execute = execute
+        self._last_local_activity = monotonic()
+
+    def load(self, *args, **kwargs):
+        # callback is Gramps' own load-progress hook -- position 2 in
+        # DbGeneric.load()'s signature, or the "callback" kwarg -- the same
+        # plain percentage function cli/grampscli.py's _pulse_progress and
+        # gui/dbloader.py's real progress-bar wiring already provide.
+        # Forwarded to _sync_from_server_async() so a slow initial catch-up
+        # (a new mirror, or one that's been offline a while) shows real
+        # progress instead of Gramps just looking hung; _poll_tick()'s own
+        # background-poll call deliberately leaves this at its None
+        # default, since a 10-second background tick shouldn't pop a
+        # progress bar.
+        callback = kwargs.get("callback")
+        if callback is None and len(args) >= 2:
+            callback = args[1]
+        # Labels the already-visible progress bar dbloader.py shows for
+        # the duration of this call ("Syncing with Gramps Web API: NN%")
+        # instead of leaving it a bare percentage -- see
+        # _wrap_progress_callback()'s own docstring for why this is safe
+        # for callers (the CLI's) that don't accept a label at all.
+        callback = _wrap_progress_callback(callback, _("Syncing with Gramps Web API"))
+        # mode is position 3 in DbGeneric.load()'s signature, defaulting to
+        # DBMODE_W -- read the same two ways as callback above. A tree
+        # opened read-only never pushes, so it needs no write permissions.
+        mode = kwargs.get("mode")
+        if mode is None and len(args) >= 3:
+            mode = args[2]
+        if mode is None:
+            mode = DBMODE_W
+        LOG.debug(
+            "load: %s (mode %s)", args[0] if args else kwargs.get("directory"), mode
+        )
+        super().load(*args, **kwargs)
+        # Each check below makes exactly one network call. Run via
+        # _run_async_to_completion() (on io_runner, main loop pumped while
+        # waiting) rather than the old synchronous versions directly:
+        # confirmed live (2026-08-17) that three back-to-back blocking
+        # calls here, with nothing pumping the loop between them, is
+        # enough on its own to make the window unresponsive.
+        #
+        # Each also reports a small, fixed percentage once it succeeds --
+        # not a real fraction of anything, just visible proof of progress
+        # during a stretch that, before this, reported nothing at all.
+        # Reported live (2026-08-17): checks + a full bootstrap resync
+        # (see _bootstrap_full_resync() below) can together leave the bar
+        # motionless for over ten seconds before the reimport's own real
+        # percentages start arriving.
+        for check_name, start_chain, percent_after in (
+            (
+                "identity",
+                lambda on_done, on_error: self._check_identity_async(on_done, on_error),
+                5,
+            ),
+            (
+                "permissions",
+                lambda on_done, on_error: self._check_permissions_async(
+                    on_done, on_error, writable=(mode == DBMODE_W)
+                ),
+                10,
+            ),
+            (
+                "server version",
+                lambda on_done, on_error: self._check_server_version_async(
+                    on_done, on_error
+                ),
+                15,
+            ),
+            (
+                "history API version",
+                lambda on_done, on_error: self._check_history_cursor_support_async(
+                    on_done, on_error
+                ),
+                18,
+            ),
+        ):
+            result = self._run_async_to_completion(start_chain)
+            if result is None:
+                LOG.debug("load: tree closed during %s check; aborting", check_name)
+                return
+            if callback is not None:
+                callback(percent_after)
+        # A quick, synchronous, unwrapped check for the totals-shortfall
+        # case -- the same condition _mirror_is_short_of_the_server_async()
+        # checks, done directly here rather than through the async chain.
+        # If the mirror is clearly behind, run the whole resync outside
+        # _run_async_to_completion()'s pump loop entirely (see
+        # _bootstrap_full_resync()'s own docstring), skipping the wrapped
+        # record-sync call below (a bootstrap resync already brings the
+        # mirror fully current, same as the async path's effect).
+        # Deliberately does not cover the other full-resync trigger (an
+        # empty-"changes" marker on an otherwise-adequate feed) -- that
+        # still goes through _full_resync_async() via the wrapped path
+        # below, same as before this method existed.
+        needs_bootstrap_resync = False
+        if not self._get_metadata("pending_pushes", default=[]):
+            try:
+                local_total = self.get_total()
+                server_total = self.web_client.get_object_count()
+            except _CONNECTION_ERRORS as err:
+                raise DbConnectionError(
+                    _describe_connection_error(err), self._directory
+                ) from err
+            needs_bootstrap_resync = server_total > local_total
+        # _sync_from_server_async() runs its network legs on a worker
+        # thread; _run_async_to_completion() blocks this call (pumping
+        # the main loop so that worker thread's result can actually be
+        # delivered) until it finishes -- see that method's docstring
+        # for why load() still waits synchronously here rather than
+        # returning early, unlike everywhere else in this file.
+        tree_closed_during_sync = False
+        self._syncing = True
+        try:
+            if needs_bootstrap_resync:
+                if callback is not None:
+                    callback(20)
+                self._bootstrap_full_resync(callback)
+            else:
+                sync_result = self._run_async_to_completion(
+                    lambda on_done, on_error: self._sync_from_server_async(
+                        on_done,
+                        on_error,
+                        progress_callback=callback,
+                        verify_totals=True,
+                    )
+                )
+                tree_closed_during_sync = sync_result is None
+        except _CONNECTION_ERRORS as err:
+            raise DbConnectionError(
+                _describe_connection_error(err), self._directory
+            ) from err
+        finally:
+            self._syncing = False
+        if tree_closed_during_sync:
+            # The tree was closed (or switched away from) while this
+            # initial sync was still in flight. Nothing left to open;
+            # don't schedule polling for it.
+            LOG.debug("load: tree closed during initial sync; aborting")
+            return
+        # Fresh outage state for a freshly opened tree: these are class
+        # attributes, so an instance reused across a close()/load() would
+        # otherwise start out backed off from the previous tree's outage.
+        self._poll_failures = 0
+        self._media_poll_failures = 0
+        self._poll_interval = POLL_INTERVAL_SECONDS
+        self._polls_since_verify_totals = 0
+        self._polling_abandoned = False
+        # _sync_media_files_async() runs its network legs on a worker
+        # thread; _run_async_to_completion() blocks this call (pumping the
+        # main loop so that worker thread's result can actually be
+        # delivered) until it finishes -- see that method's docstring for
+        # why load() still waits synchronously here rather than returning
+        # early, unlike everywhere else in this file.
+        tree_closed_during_media_sync = False
+        self._syncing = True
+        try:
+            media_result = self._run_async_to_completion(
+                lambda on_done, on_error: self._sync_media_files_async(
+                    on_done, on_error
+                )
+            )
+            tree_closed_during_media_sync = media_result is None
+        except _CONNECTION_ERRORS:
+            # Unlike the record sync above, a media-file-sync failure here
+            # doesn't block opening the tree: the record mirror is already
+            # usable, and missing/un-uploaded media files are recovered on
+            # the next successful media poll (or the next load()).
+            LOG.exception("Initial media file sync failed; will retry.")
+            # Counts as this outage's one loud report, so _media_poll_tick()
+            # doesn't immediately say the same thing again 300 seconds later.
+            self._media_poll_failures = 1
+        finally:
+            self._syncing = False
+        if tree_closed_during_media_sync:
+            LOG.debug("load: tree closed during initial media sync; aborting")
+            return
+        self._poll_source_id = GLib.timeout_add_seconds(
+            POLL_INTERVAL_SECONDS, self._poll_tick
+        )
+        self._media_poll_source_id = GLib.timeout_add_seconds(
+            MEDIA_POLL_INTERVAL_SECONDS, self._media_poll_tick
+        )
+
+    def _check_identity_async(self, on_done, on_error):
+        """Require this Family Tree's own name to be "<username>@<host>"
+        for whoever GRAMPS_WEB_API_KEY currently authenticates as.
+
+        Nothing else ties a local mirror to one particular server account:
+        there is no per-tree settings.ini (see the module docstring), and
+        _sync_from_server() only ever asks for changes *after* its stored
+        sync_last_id -- it has no way to notice the mirror belongs to a
+        different account entirely and would just quietly go on mixing old
+        and new data. Requiring (and reading back) the account identity in
+        the tree's own display name catches that at load time instead, and
+        costs nothing extra: get_dbname() just rereads the same name.txt
+        Gramps already writes for the Family Tree Manager.
+
+        Both sides are compared after _FAMILY_TREE_NAME_UNSAFE_CHARS's
+        substitution, not the raw "<username>@<host>" string: the Family
+        Tree Manager's own rename callback silently applies that same
+        substitution to anything typed in (dbman.py's __change_name()), so
+        a hostname's dots can never actually reach name.txt intact -- an
+        exact-string comparison would reject every tree name Gramps itself
+        would let you type.
+
+        Runs on io_runner like every other network call in this file:
+        confirmed live (2026-08-17, against a real server) that running
+        this and the other two load()-time checks synchronously on the
+        main thread -- each one a real network round trip with nothing
+        pumping the loop in between -- is enough on its own to make the
+        window unresponsive, even before reaching any resync work.
+        """
+
+        def fetch():
+            return self.web_client.get_identity()
+
+        def on_fetched(expected):
+            expected_typeable = _FAMILY_TREE_NAME_UNSAFE_CHARS.sub("_", expected)
+            actual = self.get_dbname()
+            actual_normalized = _FAMILY_TREE_NAME_UNSAFE_CHARS.sub("_", actual)
+            if actual_normalized != expected_typeable:
+                on_error(
+                    DbConnectionError(
+                        _(
+                            'This Family Tree is named "%(actual)s", but '
+                            "GRAMPS_WEB_API_KEY currently authenticates as "
+                            '"%(expected)s". Rename this Family Tree to '
+                            '"%(expected_typeable)s" (Family Trees -> Manage '
+                            "Family Trees) if it's meant to mirror that "
+                            "account, or open/create the Family Tree "
+                            "already named that -- reusing this one would "
+                            "mix its existing local data with the other "
+                            "account's."
+                        )
+                        % {
+                            "actual": actual,
+                            "expected": expected,
+                            "expected_typeable": expected_typeable,
+                        },
+                        self._directory,
+                    )
+                )
+                return
+            on_done(True)
+
+        def on_fetch_error(exc):
+            if isinstance(exc, _CONNECTION_ERRORS):
+                on_error(
+                    DbConnectionError(_describe_connection_error(exc), self._directory)
+                )
+            else:
+                on_error(exc)
+
+        self.io_runner.run(
+            fetch, self._guarded(on_fetched), self._guarded(on_fetch_error)
+        )
+
+    def _check_permissions_async(self, on_done, on_error, writable=True):
+        """Fail at load() only if the account GRAMPS_WEB_API_KEY
+        authenticates as lacks ViewPrivate -- the one permission whose
+        absence is either loudly fatal (the history feed 403s outright) or
+        worse, silent (the export fallback just drops private records; see
+        _PERM_VIEW_PRIVATE's comment). A missing write permission
+        (AddObject/EditObject/DeleteObject) does *not* block load(): a
+        viewer- or contributor-level account can still open the tree, and
+        the mirror still polls and stays current for reading -- only
+        editing it is unavailable. self._missing_write_permissions,
+        stashed here, is what transaction_commit()/undo()/redo() check to
+        reject a local edit synchronously, before it ever reaches
+        self.dbapi as committed -- see transaction_commit()'s own
+        docstring. Logged once here too, at load() time, so a user who
+        never even attempts an edit still finds out why up front.
+
+        ``writable`` is False for a tree opened read-only (DBMODE_R), which
+        never pushes and so is not checked for write permissions at all.
+
+        Costs no extra round trip: gramps-web-api puts the permission list
+        in the access token's own claims (token.py's ``claims = {
+        "permissions": [...]}``), so get_permissions() just decodes the JWT
+        this handler already holds.
+
+        Runs on io_runner for the same reason _check_identity_async() does.
+        """
+
+        def fetch():
+            return self.web_client.get_permissions()
+
+        def on_fetched(permissions):
+            granted = set(permissions)
+            if _PERM_VIEW_PRIVATE not in granted:
+                on_error(
+                    DbConnectionError(
+                        _(
+                            "The account authenticating via GRAMPS_WEB_API_KEY is "
+                            "missing server permission(s) this addon requires: "
+                            "%(missing)s. Grant it at least the "
+                            '"%(role)s" role on the server (or ask an '
+                            "administrator to), then reopen this Family Tree. "
+                            "Opening it as-is would leave the local mirror "
+                            "silently incomplete or unable to save changes back."
+                        )
+                        % {"missing": _PERM_VIEW_PRIVATE, "role": _REQUIRED_ROLE_NAME},
+                        self._directory,
+                    )
+                )
+                return
+            missing_write = (
+                [perm for perm in _WRITE_PERMISSIONS if perm not in granted]
+                if writable
+                else []
+            )
+            self._missing_write_permissions = missing_write
+            if missing_write:
+                LOG.warning(
+                    "The account authenticating via GRAMPS_WEB_API_KEY is "
+                    'missing server permission(s) ("%s") this addon needs '
+                    "to push local changes back to the server; grant it "
+                    'the "%s" role (or ask an administrator to) to enable '
+                    "editing. Opening this Family Tree read-only against "
+                    "the server: the local mirror will keep polling and "
+                    "staying current, but any local edit will be rejected "
+                    "when it tries to push.",
+                    ", ".join(missing_write),
+                    _REQUIRED_ROLE_NAME,
+                )
+            on_done(True)
+
+        def on_fetch_error(exc):
+            if isinstance(exc, _CONNECTION_ERRORS):
+                on_error(
+                    DbConnectionError(_describe_connection_error(exc), self._directory)
+                )
+            else:
+                on_error(exc)
+
+        self.io_runner.run(
+            fetch, self._guarded(on_fetched), self._guarded(on_fetch_error)
+        )
+
+    def _check_server_version_async(self, on_done, on_error):
+        """Fail at load() if the server runs a Gramps too old to produce
+        the transaction-history serialization this addon reads.
+
+        A gramps52-era server answers auth and read-only endpoints
+        perfectly well, so nothing fails until _sync_from_server() feeds
+        its differently-shaped new_data to data_to_object() and gets a
+        bare KeyError -- see the module docstring. Asking GET /metadata/
+        up front turns that into a sentence naming both versions.
+
+        Deliberately lenient about *not knowing*: a server that doesn't
+        report a Gramps version, or reports one this can't parse, is
+        allowed through rather than blocked on a guess. The KeyError path
+        still catches a genuinely incompatible one, just less kindly.
+
+        Runs on io_runner for the same reason _check_identity_async() does.
+        """
+
+        def fetch():
+            return self.web_client.get_gramps_version()
+
+        def on_fetched(reported):
+            version = parse_version(reported)
+            if version is None or version >= MIN_SERVER_GRAMPS_VERSION:
+                on_done(True)
+                return
+            on_error(
+                DbConnectionError(
+                    _(
+                        "This server runs Gramps %(actual)s, but this addon "
+                        "needs a server running Gramps %(required)s or "
+                        "newer: older servers serialize their transaction "
+                        "history in a format it cannot read. Upgrade the "
+                        "Gramps installation behind the Gramps Web API "
+                        "server (or ask its administrator to)."
+                    )
+                    % {
+                        "actual": reported,
+                        "required": ".".join(
+                            str(part) for part in MIN_SERVER_GRAMPS_VERSION
+                        ),
+                    },
+                    self._directory,
+                )
+            )
+
+        def on_fetch_error(exc):
+            if isinstance(exc, _CONNECTION_ERRORS):
+                on_error(
+                    DbConnectionError(_describe_connection_error(exc), self._directory)
+                )
+            else:
+                on_error(exc)
+
+        self.io_runner.run(
+            fetch, self._guarded(on_fetched), self._guarded(on_fetch_error)
+        )
+
+    def _check_history_cursor_support_async(self, on_done, on_error):
+        """Fail at load() if the server's gramps-web-api is too old to
+        understand the after_id/before_id transaction-id cursor
+        get_transaction_history() now sends on every history request --
+        see that method's own docstring on why it switched off the
+        older, float timestamp-based ``after`` cursor.
+
+        Unlike a stale sync cursor, which _migrate_sync_cursor_to_id()
+        can upgrade in place, there is no graceful degradation available
+        for the *server* being too old: gramps-web-api's own query-arg
+        parser rejects any *unrecognized* query argument outright
+        (RAISE, not silently ignore -- see its api/util.py Parser), so
+        an older server 422s every single history request the moment it
+        sees after_id at all -- there would be nothing left to poll
+        with. Checked here, up front, the same way
+        _check_server_version_async() already gates an incompatible
+        Gramps library version, rather than discovered later as a
+        mysterious sync failure.
+
+        Deliberately lenient about *not knowing*, like
+        _check_server_version_async(): a server that doesn't report an
+        API version, or reports one this can't parse, is allowed
+        through rather than blocked on a guess.
+
+        Runs on io_runner for the same reason _check_identity_async()
+        does.
+        """
+
+        def fetch():
+            return self.web_client.get_api_version()
+
+        def on_fetched(reported):
+            version = parse_version(reported)
+            if version is None or version >= HISTORY_ID_CURSOR_MIN_API_VERSION:
+                on_done(True)
+                return
+            on_error(
+                DbConnectionError(
+                    _(
+                        "This server runs Gramps Web API %(actual)s, but "
+                        "this addon needs %(required)s or newer: older "
+                        "versions do not understand the exact "
+                        "transaction-id cursor this addon uses to poll "
+                        "for changes, and reject every such request "
+                        "outright. Upgrade the Gramps Web API server (or "
+                        "ask its administrator to)."
+                    )
+                    % {
+                        "actual": reported,
+                        "required": ".".join(
+                            str(part) for part in HISTORY_ID_CURSOR_MIN_API_VERSION
+                        ),
+                    },
+                    self._directory,
+                )
+            )
+
+        def on_fetch_error(exc):
+            if isinstance(exc, _CONNECTION_ERRORS):
+                on_error(
+                    DbConnectionError(_describe_connection_error(exc), self._directory)
+                )
+            else:
+                on_error(exc)
+
+        self.io_runner.run(
+            fetch, self._guarded(on_fetched), self._guarded(on_fetch_error)
+        )
+
+    def close(self, *args, **kwargs):
+        # Bumped first, before anything else: a sync/push elsewhere on the
+        # call stack may be suspended inside _guarded_pump() (waiting to
+        # find out whether it's still safe to touch self.dbapi once the
+        # main loop hands control back) or, once the ..._async() chains
+        # land, inside a worker-thread step whose eventual callback
+        # _guarded() must recognize as belonging to an abandoned chain.
+        # See _guarded_pump(), _guarded(), and the module docstring's
+        # "Keeping the GUI alive" section.
+        self._run_id += 1
+        # A callback _guarded() drops (or a _guarded_pump() call that
+        # raises) never reaches the `finally` blocks that would otherwise
+        # clear these -- that unwind only ever happens because something
+        # further up the call stack catches it, and after this point
+        # nothing does. Reset explicitly so an instance reused for a fresh
+        # load() (Gramps may reuse one WebApiDB object across Family
+        # Trees) doesn't start out believing an abandoned operation from
+        # the previous tree is still in flight.
+        self._syncing = False
+        self._pulling = False
+        self._retrying = False
+        # Stop polling a database that's no longer open -- otherwise the
+        # next tick would run _sync_from_server() (and touch self.dbapi)
+        # against a connection that's about to be (or already) closed.
+        poll_source_id = getattr(self, "_poll_source_id", None)
+        if poll_source_id is not None:
+            GLib.source_remove(poll_source_id)
+            self._poll_source_id = None
+        media_poll_source_id = getattr(self, "_media_poll_source_id", None)
+        if media_poll_source_id is not None:
+            GLib.source_remove(media_poll_source_id)
+            self._media_poll_source_id = None
+        super().close(*args, **kwargs)
+
+    def _guarded(self, callback):
+        """Wrap a worker-thread-step callback (an ``on_success``/``on_error``
+        handed to ``self.runner.run()``/``self.io_runner.run()``) so it is
+        silently dropped if close() ran while that step was in flight,
+        instead of resuming and touching a ``self.dbapi`` that is already
+        gone.
+
+        Not used yet -- introduced here alongside _run_id so later phases'
+        ..._async() methods (see the module docstring) have it ready. The
+        async equivalent of _guarded_pump(): where _guarded_pump() raises
+        to unwind a still-synchronous call stack, this instead just never
+        calls through, since there is no stack left to unwind once the
+        step it wraps has already been handed to a worker thread or the
+        idle-add queue -- the same posture GrampsWebSync's
+        SyncSession._guarded() takes for a run the user has abandoned.
+        """
+        run_id = self._run_id
+
+        def guarded(value):
+            if run_id == self._run_id:
+                callback(value)
+            else:
+                LOG.debug("Dropping a callback from a chain abandoned by close().")
+
+        return guarded
+
+    def _guarded_pump(self):
+        """_pump_main_loop(), then raise _DatabaseClosed if that let
+        close() run out from under us.
+
+        Every _pump_main_loop() call this class makes goes through here
+        instead of the bare function. Without it, a sync/push resumes
+        after the pump and immediately crashes trying to touch
+        self.dbapi -- the user switching or closing this very Family Tree
+        is a perfectly ordinary GTK event, and reentering the main loop
+        mid-operation (see the module docstring) is exactly what lets it
+        get dispatched underneath a suspended call. Callers that can
+        trigger a pump (directly or via webapi_client's on_wait/on_chunk
+        hooks) let this propagate up to whichever entry point started
+        them -- _poll_tick(), _media_poll_tick(), load(), _push_payload(),
+        _flush_pending_pushes() -- which treat it as nothing left to do,
+        not a failure.
+
+        Detects this the same way _guarded() does -- comparing _run_id
+        before and after -- rather than a boolean _closed flag, since an
+        instance can be load()-ed again after close() (see _run_id's own
+        docstring); capturing run_id fresh on each call, right before the
+        one pump it guards, is exactly the right scope: nothing before
+        this call needed protecting (it already ran), and nothing this
+        call's caller does after seeing the raised exception touches
+        self.dbapi either.
+        """
+        run_id = self._run_id
+        _pump_main_loop()
+        if self._run_id != run_id:
+            raise _DatabaseClosed()
+
+    def _run_async_to_completion(self, start_chain):
+        """Block the calling thread (always the main thread -- this is
+        only ever called from load()) until an async chain finishes,
+        while still pumping the main loop so the worker-thread dispatch
+        that chain depends on can actually be delivered.
+
+        start_chain(on_done, on_error) must kick off exactly one
+        ..._async() chain (e.g. ``lambda on_done, on_error:
+        self._sync_media_files_async(on_done, on_error)``) and return
+        immediately, the same contract every ..._async() method in this
+        file follows.
+
+        Raises whatever the chain's on_error received. Returns whatever
+        its on_done received -- or None, with nothing raised, if the tree
+        was closed while this was waiting (_guarded_pump() propagates
+        that as _DatabaseClosed, caught here rather than left to whoever
+        called this). load() is the one caller that still needs a
+        synchronous answer: Gramps core's DbGeneric.load() contract
+        requires the tree to be ready by the time it returns, unlike
+        every other entry point in this file (_poll_tick(),
+        transaction_commit(), ...), which starts a chain and returns
+        immediately -- see the module docstring's "Keeping the GUI alive"
+        section for why load() alone keeps this synchronous wait instead
+        of also going fully asynchronous.
+        """
+        box = {}
+
+        def on_done(value=None):
+            box["done"] = True
+            box["value"] = value
+
+        def on_error(exc):
+            box["done"] = True
+            box["error"] = exc
+
+        start_chain(on_done, on_error)
+        while not box.get("done"):
+            try:
+                self._guarded_pump()
+            except _DatabaseClosed:
+                LOG.debug("load: tree closed while waiting on an async chain")
+                return None
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def _poll_tick(self):
+        """GLib.timeout_add_seconds callback -- see the module docstring's
+        polling section. Must return True (GLib.SOURCE_CONTINUE) to keep
+        firing.
+
+        Unlike the old synchronous version, always returns
+        GLib.SOURCE_CONTINUE immediately: starting
+        _sync_from_server_async() can't report success or failure
+        synchronously, so the backoff/recovery bookkeeping
+        (_on_poll_success()/_on_poll_error(), via _reschedule_poll())
+        happens later, from its on_done/on_error. A tree closed mid-sync
+        needs no special handling here to stop this timer -- close()
+        removes it directly, and _guarded() (wrapping
+        _sync_from_server_async()'s callbacks) silently drops one
+        belonging to an abandoned chain rather than this method having to
+        notice and react.
+
+        An unreachable server is an expected, self-healing condition, not
+        a bug in this addon: local edits keep working against the mirror
+        and queue up for the next successful push (_queue_pending_push()),
+        and the sync cursor is persisted, so the poll only has to survive
+        the outage. It is therefore reported once per outage rather than
+        once per tick, and the timer backs off while it lasts (see
+        _record_poll_failure()) -- a 10-second traceback loop for as long
+        as a server stays down buries anything else in the log and makes a
+        routine outage look like a crash.
+
+        Also asks for a totals check (verify_totals=True) once every
+        VERIFY_TOTALS_POLL_INTERVAL_SECONDS worth of ticks -- see that
+        constant and _mirror_is_short_of_the_server_async(). Tick-counted
+        (self._polls_since_verify_totals), not wall-clock-timed: this
+        still lands roughly on schedule during ordinary polling, and
+        stretches out for free during a backoff (_record_poll_failure())
+        without any extra bookkeeping, which is the right direction to
+        drift -- there is nothing useful to verify totals against while
+        the server is unreachable anyway. Reset to 0 both here and by
+        load(), which always runs its own check regardless."""
+        if self._syncing:
+            # Reached from inside a still-running chain this tick would
+            # otherwise start again underneath.
+            LOG.debug("poll: a sync is already running; skipping this tick")
+            return GLib.SOURCE_CONTINUE
+        self._syncing = True
+        self._polls_since_verify_totals += 1
+        verify_totals = self._polls_since_verify_totals >= (
+            VERIFY_TOTALS_POLL_INTERVAL_SECONDS // POLL_INTERVAL_SECONDS
+        )
+        if verify_totals:
+            self._polls_since_verify_totals = 0
+        self._sync_from_server_async(
+            on_done=self._finish_async_op(self._on_poll_success),
+            on_error=self._finish_async_op(self._on_poll_error),
+            verify_totals=verify_totals,
+        )
+        return GLib.SOURCE_CONTINUE
+
+    def _on_poll_success(self, applied):
+        """_poll_tick()'s on_done -- see that method. Also where the next
+        interval is chosen between POLL_INTERVAL_SECONDS and, once
+        POLL_IDLE_THRESHOLD_SECONDS of local inactivity has passed,
+        POLL_IDLE_INTERVAL_SECONDS -- see that constant's own docstring.
+        """
+        if self._poll_failures:
+            LOG.info(
+                "Sync from server succeeded again after %d failed attempt(s).",
+                self._poll_failures,
+            )
+            self._poll_failures = 0
+        idle_for = monotonic() - self._last_local_activity
+        if idle_for >= POLL_IDLE_THRESHOLD_SECONDS:
+            self._reschedule_poll(POLL_IDLE_INTERVAL_SECONDS)
+        else:
+            self._reschedule_poll(POLL_INTERVAL_SECONDS)
+
+    def _on_poll_error(self, exc):
+        """_poll_tick()'s on_error -- see that method."""
+        if not isinstance(exc, _CONNECTION_ERRORS):
+            # Not a connectivity classification this poll knows how to
+            # back off from -- see _on_media_poll_error()'s identical
+            # reasoning.
+            LOG.error(
+                "Unexpected error during periodic sync from server.", exc_info=exc
+            )
+            return
+        if not _is_retryable_push_error(exc):
+            # A permanent rejection (a revoked/expired token, an account
+            # the server no longer has -- see _give_up_polling()), not a
+            # connectivity blip: backing this off and retrying forever
+            # would just repeat the identical rejection every
+            # POLL_BACKOFF_MAX_SECONDS, silently, with nothing durable to
+            # tell the user their session is permanently stuck.
+            self._give_up_polling(exc)
+            return
+        self._record_poll_failure(exc)
+
+    def _give_up_polling(self, exc):
+        """Reached from either _on_poll_error() or _on_media_poll_error()
+        once _is_retryable_push_error() says a poll's own request was
+        permanently rejected, not merely unreachable -- most plausibly
+        the account GRAMPS_WEB_API_KEY authenticates as no longer being
+        valid (a revoked/expired refresh token, or the server itself
+        having been reset: a fresh database behind the same URL, the old
+        account simply gone). Both timers share the one credential, so a
+        rejection on either means neither can succeed again -- this
+        stops both, not just whichever poller noticed first.
+
+        Deliberately does not call self.close(): nothing here can tell
+        dbstate/viewmanager a tree closed -- that direction only ever
+        runs the other way (viewmanager.py calls db.close(), never the
+        reverse; confirmed against gui/viewmanager.py) -- so doing that
+        would leave Gramps' own UI still showing the tree as open while
+        the connection underneath is actually gone, silently broken
+        rather than visibly stopped. What this leaves instead: sync
+        stopped, but the tree stays open and usable, local edits keep
+        working against the mirror and queuing (same as any other
+        unreachable-server state -- they simply never drain), and the
+        user has a clear, undismissable answer for why nothing is
+        syncing, via _notify_fatal_poll_error()'s dialog -- the nearest
+        equivalent reachable from here to load()'s own DbConnectionError
+        path, which isn't itself reachable once load() has already
+        returned.
+
+        Idempotent via self._polling_abandoned: both pollers can hit
+        this around the same moment (they share the one credential), and
+        the second call here stops its own timer quietly rather than
+        show a second dialog for the same underlying problem.
+        """
+        for attr in ("_poll_source_id", "_media_poll_source_id"):
+            source_id = getattr(self, attr, None)
+            if source_id is not None:
+                GLib.source_remove(source_id)
+                setattr(self, attr, None)
+        if self._polling_abandoned:
+            return
+        self._polling_abandoned = True
+        detail = _describe_connection_error(exc)
+        LOG.error(
+            "Periodic sync from the server was permanently rejected (%s); "
+            "this tree's credentials appear to no longer be valid. "
+            "Polling has stopped -- local edits will keep working but "
+            "will not sync until this tree is closed and reopened with a "
+            "valid GRAMPS_WEB_API_KEY.",
+            detail,
+        )
+        _notify_fatal_poll_error(detail)
+
+    def _record_poll_failure(self, err):
+        """Handle a failed _poll_tick() sync: report it (once per outage,
+        with the detail kept at DEBUG for whoever is diagnosing one) and
+        slow the timer down, doubling up to POLL_BACKOFF_MAX_SECONDS."""
+        self._poll_failures += 1
+        interval = min(self._poll_interval * 2, POLL_BACKOFF_MAX_SECONDS)
+        if self._poll_failures == 1:
+            LOG.warning(
+                "Periodic sync from server failed (%s); retrying, backing off "
+                "to at most every %d seconds until the server answers again.",
+                err,
+                POLL_BACKOFF_MAX_SECONDS,
+            )
+            LOG.debug("Periodic sync failure detail", exc_info=err)
+        else:
+            LOG.debug(
+                "Periodic sync from server still failing after %d attempts (%s); "
+                "next retry in %d seconds.",
+                self._poll_failures,
+                err,
+                interval,
+                exc_info=err,
+            )
+        self._reschedule_poll(interval)
+
+    def _reschedule_poll(self, interval):
+        """Point the record poll at a new interval. A no-op when the
+        interval is unchanged, which is the common case on both a
+        healthy poll and a failing one already sitting at
+        POLL_BACKOFF_MAX_SECONDS.
+
+        Unlike the old synchronous _poll_tick(), which could report
+        GLib.SOURCE_REMOVE from inside the very timeout callback being
+        replaced (letting GLib itself drop that firing instance), this
+        is now always called from an async on_done/on_error, well after
+        _poll_tick() already returned GLib.SOURCE_CONTINUE to keep the
+        current timer alive -- so the old timer has to be removed
+        explicitly (GLib.timeout_add_seconds() has no way to retime an
+        existing source in place either way) rather than relying on a
+        return value GLib is no longer watching for by the time this
+        runs."""
+        if interval == self._poll_interval:
+            return
+        self._poll_interval = interval
+        GLib.source_remove(self._poll_source_id)
+        self._poll_source_id = GLib.timeout_add_seconds(interval, self._poll_tick)
+
+    def _media_poll_tick(self):
+        """GLib.timeout_add_seconds callback for the slower media-file
+        scan -- same contract as _poll_tick() (must return True to keep
+        firing), just for _sync_media_files_async() instead of the
+        record-history poll.
+
+        Unlike _poll_tick(), this always returns GLib.SOURCE_CONTINUE
+        immediately: starting _sync_media_files_async() can't report
+        success or failure synchronously the way the old
+        _sync_media_files() call this replaced could, so that bookkeeping
+        (_on_media_poll_success()/_on_media_poll_error()) happens later,
+        from its on_done/on_error. A tree closed mid-sync needs no
+        special handling here the way it once did to stop this very
+        timer -- close() removes the timeout itself, and _guarded()
+        (wrapping _sync_media_files_async()'s callbacks) silently drops
+        one belonging to an abandoned chain rather than this method
+        having to notice and react.
+
+        Reported once per outage for the same reason as _poll_tick(), but
+        with no backoff to go with it: MEDIA_POLL_INTERVAL_SECONDS is
+        already as coarse as that poll's backoff cap."""
+        if self._syncing:
+            LOG.debug("media poll: a sync is already running; skipping this tick")
+            return GLib.SOURCE_CONTINUE
+        self._syncing = True
+        self._sync_media_files_async(
+            on_done=self._finish_async_op(self._on_media_poll_success),
+            on_error=self._finish_async_op(self._on_media_poll_error),
+        )
+        return GLib.SOURCE_CONTINUE
+
+    def _on_media_poll_success(self, result):
+        """_media_poll_tick()'s on_done -- see that method."""
+        if self._media_poll_failures:
+            LOG.info(
+                "Media file sync succeeded again after %d failed attempt(s).",
+                self._media_poll_failures,
+            )
+            self._media_poll_failures = 0
+
+    def _on_media_poll_error(self, exc):
+        """_media_poll_tick()'s on_error -- see that method."""
+        if not isinstance(exc, _CONNECTION_ERRORS):
+            # Not a connectivity classification this poll knows how to
+            # back off from. The old synchronous _sync_media_files() let
+            # anything else propagate out of _media_poll_tick() uncaught
+            # (there was nowhere for it to go but the caller); there is no
+            # such caller for an async on_error, so log it loudly here
+            # instead of silently losing it.
+            LOG.error("Unexpected error during periodic media file sync.", exc_info=exc)
+            return
+        if not _is_retryable_push_error(exc):
+            # Same permanent-rejection reasoning as _on_poll_error() --
+            # see _give_up_polling().
+            self._give_up_polling(exc)
+            return
+        if self._media_poll_failures == 0:
+            LOG.warning(
+                "Periodic media file sync failed (%s); will retry every " "%d seconds.",
+                exc,
+                MEDIA_POLL_INTERVAL_SECONDS,
+            )
+            LOG.debug("Periodic media file sync failure detail", exc_info=exc)
+        else:
+            LOG.debug(
+                "Periodic media file sync still failing after %d attempts (%s).",
+                self._media_poll_failures + 1,
+                exc,
+                exc_info=exc,
+            )
+        self._media_poll_failures += 1
+
+    def _commit_base(self, obj, obj_key, trans, change_time):
+        """Normalize every string field on ``obj`` to "\\n"-only line
+        endings (not Unicode form -- see _normalize_line_endings())
+        before DBAPI's own _commit_base() ever
+        serializes it to storage -- the single choke point every
+        commit_<type>() method (DbGeneric) funnels through, for every
+        write this local mirror ever makes: an ordinary local edit, and
+        _apply_change()'s replay of an incrementally pulled server
+        change alike. Confirmed ImportXml (the reimport
+        _full_resync_async()/_bootstrap_full_resync() run) commits the
+        same way -- self.db.commit_person()/commit_family()/... -- not
+        some bulk/raw bypass, so nothing writes a primary object without
+        passing through here.
+
+        Deliberately skipped when trans.batch: a reimport's own DbTxn is
+        batch=True, and DBAPI._commit_base() itself already skips its
+        usual per-object trans.add() bookkeeping in that case -- paying
+        a fresh object_to_dict()/data_to_object() round trip here
+        regardless would add real cost to every one of a resync's
+        potentially tens of thousands of objects, whether or not that
+        particular object needs correcting. _normalize_reimported_text()
+        (called once, in bulk, via _iter_raw_data(), right after the
+        reimport itself -- see _full_resync_async()'s rebuild()) is the
+        batch-mode equivalent of this, and re-commits only the objects
+        that actually need it.
+
+        See _normalize_line_endings() for why, and TODO.md gap 9 for the
+        round-trip-fidelity bug this and _normalize_reimported_text()
+        exist to close -- two directions of the same problem: this one
+        stops the
+        addon itself (or whatever handed it the text -- GTK, an input
+        method, pasted Windows-authored text, anything upstream of
+        Gramps) from ever being the source of a mismatch;
+        _normalize_reimported_text() cleans one up after the fact if it
+        arrived via a reimport instead.
+        """
+        if not trans.batch:
+            data = object_to_dict(obj)
+            normalized = _normalize_line_endings(data)
+            if normalized != data:
+                obj = data_to_object(normalized)
+        return super()._commit_base(obj, obj_key, trans, change_time)
+
+    def transaction_begin(self, transaction):
+        """Hook DbTxn.__enter__ (which calls this immediately, before the
+        transaction's body runs) to snapshot every primary object's full
+        current data ahead of a batch=True transaction that isn't one of
+        _sync_from_server()'s own (self._pulling) -- _reconcile_batch_
+        commit() needs that "before" picture (not just which handles
+        exist) to diff against, since DBAPI skips its usual undo-log
+        recording for a batch commit regardless of who started it. See
+        the module docstring and _reconcile_batch_commit()'s own
+        docstring for why full data, not just handles or timestamps."""
+        result = super().transaction_begin(transaction)
+        if transaction.batch and not self._pulling:
+            transaction._webapidb_before = self._snapshot_all_objects()
+        return result
+
+    def transaction_commit(self, transaction):
+        # Reject before anything is committed locally -- not just before
+        # the push -- when the account is *known*, from load()'s own
+        # _check_permissions_async(), to lack write access altogether:
+        # self._missing_write_permissions is set once there and never
+        # updated mid-session, so this only ever catches the load-time-
+        # known case, not a permission revoked after load() (that one is
+        # still only discoverable from a live 403 -- see
+        # _push_payload_async()'s on_push_error and the module
+        # docstring). transaction_begin() already called self.dbapi.begin()
+        # for this transaction and whatever the caller's DbTxn body did
+        # (commit_person(), etc.) is only staged in that still-open SQL
+        # transaction, not yet durable -- transaction_abort() (self.dbapi.
+        # rollback()) unwinds it cleanly instead of leaving it half-open,
+        # which simply calling super().transaction_commit() at some later
+        # point would not: DbTxn.__exit__() only calls transaction_abort()
+        # for an exception raised *inside* the `with` block, not one
+        # raised by transaction_commit() itself, so this method has to do
+        # that part itself before raising. Exempted: self._pulling (a
+        # server-to-local replay, which must always be allowed so a
+        # read-only account can still poll and stay current -- see the
+        # module docstring) and self._recording_note (the addon's own
+        # note/tag bookkeeping, which must go on committing locally and
+        # attempting its own push exactly as before -- see
+        # _record_conflict_notes()'s docstring).
+        if (
+            self._missing_write_permissions
+            and not self._pulling
+            and not self._recording_note
+        ):
+            self.transaction_abort(transaction)
+            raise _missing_write_permission_error(self._missing_write_permissions)
+        # Must run before super(): it clears the transaction's records.
+        payload = transaction_to_json(transaction)
+        # The same description Gramps desktop's own editors set on this
+        # DbTxn (e.g. "Add Person (Jane Doe)", editperson.py) and the
+        # convention gramps-web-api's own per-object PUT/POST endpoints
+        # use for their transaction log -- forwarded as-is so a push from
+        # this addon shows up the same way in the server's revision
+        # history instead of as a generic "Raw transaction". See
+        # push_transaction()'s docstring.
+        message = transaction.get_description() or None
+        super().transaction_commit(transaction)
+        before = getattr(transaction, "_webapidb_before", None)
+        if before is not None:
+            self._reconcile_batch_commit(before, message=message)
+            return
+        # self._retrying is set by _retry_after_conflict() while it holds
+        # its own DbTxn open, so the push this commit triggers knows it is
+        # itself a conflict retry and won't retry again on a second
+        # conflict -- see _start_push().
+        self._start_push(payload, is_retry=self._retrying, message=message)
+
+    def undo(self, update_history=True):
+        # Unlike transaction_commit(), there is no way to let the local
+        # change happen and then reject just the push: DbGenericUndo._undo()
+        # (Gramps core) commits directly via self.db._txn_begin()/
+        # _txn_commit(), never through transaction_commit(), so by the
+        # time control would return here the local mirror has already
+        # changed regardless of what this method does. Reject before even
+        # calling super() instead -- nothing has touched self.dbapi yet,
+        # so there is nothing to unwind, unlike transaction_commit()'s own
+        # transaction_abort() call. See that method's docstring for what
+        # self._missing_write_permissions does and does not catch.
+        if self._missing_write_permissions:
+            raise _missing_write_permission_error(self._missing_write_permissions)
+        # Peek before super(): DbGenericUndo._undo() pops this DbTxn off
+        # undoq. The DbTxn's own backing data isn't touched by that (it
+        # just moves queues), so building its JSON payload could happen
+        # either side of super() -- only grabbing the reference itself
+        # can't wait.
+        transaction = self.undodb.undoq[-1] if self.undodb.undo_count else None
+        result = super().undo(update_history)
+        if result and transaction is not None:
+            description = transaction.get_description()
+            message = _("Undo: %s") % description if description else None
+            self._start_push(
+                transaction_to_json(transaction), undo=True, message=message
+            )
+        return result
+
+    def redo(self, update_history=True):
+        # See undo()'s own comment: DbGenericUndo._redo() commits directly,
+        # bypassing transaction_commit(), so this has to reject before
+        # calling super() too.
+        if self._missing_write_permissions:
+            raise _missing_write_permission_error(self._missing_write_permissions)
+        transaction = self.undodb.redoq[-1] if self.undodb.redo_count else None
+        result = super().redo(update_history)
+        if result and transaction is not None:
+            description = transaction.get_description()
+            message = _("Redo: %s") % description if description else None
+            # Redo is just re-applying the original transaction forward --
+            # not a variant of undo=True. See push_transaction()'s docstring.
+            self._start_push(transaction_to_json(transaction), message=message)
+        return result
+
+    def _start_push(self, payload, undo=False, is_retry=False, message=None):
+        """Route a locally-intended push through the single-flight gate
+        self._syncing (see the module docstring): the true top-level
+        entry point for a given local edit -- transaction_commit(),
+        undo(), redo() -- claims self._syncing here before anything
+        touches the network, and only the terminal handler
+        _finish_async_op() wraps releases it, once this whole chain
+        (including any conflict-recovery detour through
+        _push_payload_async() -> _resync_after_conflict_async() ->
+        _retry_after_conflict()'s own nested push) has actually
+        finished -- not merely been started.
+
+        A recursive call (is_retry=True, reached only via
+        _retry_after_conflict()'s own nested transaction_commit()) never
+        claims self._syncing itself: it is always already held by
+        whichever outer call started this chain, and reuses that outer
+        call's own completion callbacks (self._retry_chain_done/
+        self._retry_chain_error, stashed by _after_conflict_resync())
+        so the chain's real end -- not just this recursive leg's local
+        commit -- is what finally clears the flag. An earlier version of
+        this design let self._syncing clear as soon as the retry's local
+        DbTxn committed, before its own nested re-push (a real network
+        round trip) had actually resolved -- exactly the class of race
+        this refactor exists to eliminate, just reintroduced one level
+        up if not guarded against here too.
+
+        If self._syncing is already held by something else when a
+        non-retry payload arrives, the push is queued
+        (_queue_pending_push()) rather than raced against whatever is in
+        flight -- deferred, not dropped: _finish_async_op() flushes the
+        queue once the in-flight chain completes.
+
+        self._recording_note (set only around _record_conflict_notes()'s
+        own commit -- see that method) is the one exception: it never
+        queues, even when self._syncing is held. That docstring claims
+        attaching a note is "safe even if that push itself hits a
+        conflict" purely because merge() unions list-valued changes --
+        but that safety only actually applies to a push that goes out
+        through _push_payload_async()'s own resync-then-merge conflict
+        handling, not to one sitting in the pending-push queue, whose own
+        conflict handling has always been (and, after a reentrancy hazard
+        found trying to change it -- see _flush_one_pending_push()'s
+        on_push_error -- still is) an unconditional drop. Confirmed live
+        (live_tests/test_live_repeated_conflict_note_trail.py) that a
+        note commit landing in the queue this way lost the note with
+        nothing to show for it, exactly contradicting that docstring.
+        _send_note_payload_best_effort() sends it immediately instead --
+        no queueing, so it never reaches that path in the first place --
+        and, if this specific send itself conflicts, one bounded
+        resync-and-reattach retry of its own; see that method's
+        docstring and self._note_retry_conflicts.
+        """
+        if not payload:
+            # A self._pulling commit (a resync's own reimport) is never
+            # the retry's own commit, even when a synchronous runner
+            # nests it inside one with self._retrying still set -- it
+            # must not complete the retry chain early.
+            if (
+                is_retry
+                and self._retry_chain_done is not None
+                and not self._pulling
+            ):
+                self._retry_chain_done(None)
+            return
+        if not is_retry:
+            if self._recording_note:
+                # Regardless of self._syncing: note bookkeeping (the note
+                # itself *and* the tag commits _get_or_create_tag() makes
+                # for it) must never enter _push_payload_async()'s own
+                # conflict -> resync -> retry -> give-up machinery. Its
+                # retry recommits under a generic description, so a
+                # give-up there no longer matches _is_message_note_push()
+                # and records a note about the note -- which recursed
+                # without bound whenever self._syncing happened to be
+                # clear here (e.g. after _push_payload_async()'s
+                # non-retryable branch releases it before recording).
+                retry_conflicts = self._note_retry_conflicts
+                self._note_retry_conflicts = None
+                self._send_note_payload_best_effort(
+                    payload,
+                    undo=undo,
+                    message=message,
+                    retry_conflicts=retry_conflicts,
+                )
+                return
+            if self._syncing:
+                self._queue_pending_push(payload, undo=undo, message=message)
+                return
+            self._syncing = True
+            on_done = self._finish_async_op(None)
+            on_error = self._finish_async_op(None)
+        else:
+            on_done = self._retry_chain_done or self._finish_async_op(None)
+            on_error = self._retry_chain_error or self._finish_async_op(None)
+        self._push_payload_async(
+            payload, on_done, on_error, undo=undo, is_retry=is_retry, message=message
+        )
+
+    def _payload_for_server(self, payload, undo=False):
+        """The payload to actually send: Note "old" text aligned with the
+        server's line endings (_align_note_line_endings_with_server()).
+        Skipped for undo=True, where the server swaps old/new and
+        compares the payload's "new" instead. Network call -- io_runner
+        only."""
+        if undo:
+            return payload
+        return _align_note_line_endings_with_server(
+            payload, self.web_client.get_note_text
+        )
+
+    def _send_note_payload_best_effort(
+        self, payload, undo=False, message=None, retry_conflicts=None
+    ):
+        """Push a message-note commit right now, bypassing both the
+        self._syncing single-flight gate and the pending-push queue --
+        see _start_push()'s own docstring for why self._recording_note
+        routes here instead of queuing like any other payload would.
+
+        Deliberately does *not* go through _push_payload_async() for this
+        first attempt: that method's conflict handling triggers a full
+        resync (_resync_after_conflict_async() -> _full_resync_async()),
+        which touches self.dbapi -- exactly what self._syncing exists to
+        keep only one chain doing at a time (see _start_push()'s
+        docstring), and firing that unconditionally, on every note send,
+        concurrently with whatever outer chain may still be running,
+        would race it far more often than the conflict this exists to
+        recover from actually occurs. A single, best-effort attempt with
+        no up-front resync is the trade for the common case: this is pure
+        network I/O on io_runner, no self.dbapi touch, so nothing here
+        can race the outer chain either way.
+
+        retry_conflicts changes what happens on that attempt's failure.
+        ``None`` (a plain send, or this is already itself the one retry
+        -- see _record_conflict_notes()'s own ``_retry_on_conflict``)
+        means the old behavior: log and stop, the note stays local-only
+        for this session. Otherwise -- the original, ``_retry_on_
+        conflict=True`` call -- a WebApiPushConflict specifically (the
+        one failure mode with an actual fix available: the local mirror
+        this note's "old" snapshot was built from was, or has since
+        become, stale relative to the server) gets exactly one recovery
+        attempt: a full resync, the same _resync_after_conflict_async()
+        every other conflicted push in this file already uses, followed
+        by _record_conflict_notes(retry_conflicts, _retry_on_conflict=
+        False) to rebuild and reattach the note fresh against the
+        now-current local mirror -- not a bare resend of this same
+        payload, whose "old" would still be exactly as stale as what
+        just got rejected. Bounded to one attempt (the recursive call's
+        own self._note_retry_conflicts is None -- see _start_push()) so
+        a genuinely hot object can't send this into an unbounded loop,
+        same ceiling _after_conflict_resync() already holds the main
+        edit's own retry to.
+
+        If self._syncing is already clear when that retry starts (the
+        outer chain finished first, or _push_payload_async()'s
+        non-retryable branch released it before recording), the retry
+        claims it for the resync's duration and releases it through
+        _finish_async_op(). If it's still held by the outer chain, the
+        retry runs under that chain's claim -- the same overlap every
+        note-recording call site already accepts.
+
+        A connectivity/5xx failure (_is_retryable_push_error(), conflicts
+        excluded) is queued via _queue_pending_push() like any other
+        push. Anything else (a second genuine conflict after the retry,
+        a permanent 4xx, the resync itself failing) is logged and left
+        at that. No further
+        note-about-this-note is recorded either way: self._recording_note
+        is still True for the whole duration (see
+        _record_conflict_notes()), so a nested transaction_commit() from
+        this call's own failure handling would itself just recurse into
+        this same method -- avoided entirely by not attempting one.
+        """
+
+        def do_push():
+            # io_runner: pure network, no self.dbapi touch -- see
+            # _push_payload_async()'s do_push() for why
+            # _use_background_push() belongs here too.
+            background = self._use_background_push(payload)
+            self.web_client.push_transaction(
+                self._payload_for_server(payload, undo),
+                undo=undo,
+                background=background,
+                message=message,
+            )
+
+        def on_sent(_result):
+            pass
+
+        def on_send_error(exc):
+            if retry_conflicts is not None and isinstance(exc, WebApiPushConflict):
+                LOG.warning(
+                    "Message-note commit conflicted (%s); resyncing once "
+                    "and reattaching it fresh instead of giving up "
+                    "immediately.",
+                    exc,
+                )
+
+                # Hold self._syncing across the resync when nothing else
+                # does, so a poll tick or fresh edit can't start its own
+                # dbapi-touching chain underneath it; released through
+                # _finish_async_op() so anything queued meanwhile flushes.
+                release = None
+                if not self._syncing:
+                    self._syncing = True
+                    release = self._finish_async_op(None)
+
+                def on_resync_done(_result):
+                    # Which field made the server reject this note's own
+                    # "old" snapshot? See TODO.md gap #7.
+                    if not self._log_conflict_field_diffs(payload):
+                        LOG.warning(
+                            "conflict-diff: the rejected message-note "
+                            "push's snapshot matches the freshly-resynced "
+                            "local copy exactly -- whatever the server "
+                            "disagreed with doesn't survive a resync."
+                        )
+                    try:
+                        self._record_conflict_notes(
+                            retry_conflicts, _retry_on_conflict=False
+                        )
+                    finally:
+                        if release is not None:
+                            release(None)
+
+                def on_resync_error(resync_exc):
+                    if release is not None:
+                        release(None)
+                    LOG.warning(
+                        "Could not resync after a message-note conflict "
+                        "(%s); the note was not resent. The note exists "
+                        "locally but the server won't see it this "
+                        "session.",
+                        resync_exc,
+                    )
+
+                # _full_resync_async() already wraps on_done/on_error in
+                # self._guarded() itself -- no need to do it again here.
+                self._resync_after_conflict_async(
+                    on_done=on_resync_done, on_error=on_resync_error
+                )
+                return
+            if not isinstance(exc, WebApiPushConflict) and _is_retryable_push_error(
+                exc
+            ):
+                # Connectivity/5xx: queue it like any other push. The
+                # queue replays it on the next successful contact; if the
+                # replay itself conflicts it's dropped there, and
+                # _is_message_note_push() keeps that from recording a
+                # note about the note.
+                LOG.warning(
+                    "Could not send a message-note commit (%s); queued for "
+                    "retry on the next successful contact with the server.",
+                    exc,
+                )
+                self._queue_pending_push(payload, undo=undo, message=message)
+                return
+            LOG.warning(
+                "Could not send a message-note commit (%s); not retried "
+                "again. The note exists locally but the server won't see "
+                "it this session.",
+                exc,
+            )
+
+        self.io_runner.run(do_push, self._guarded(on_sent), self._guarded(on_send_error))
+
+    def _finish_async_op(self, on_done):
+        """Wrap a top-level async chain's true completion handler so
+        self._syncing only clears once the chain is genuinely done --
+        including one attempt at flushing anything that arrived and got
+        queued (_queue_pending_push()) while this chain held the flag.
+        Shared by every top-level entry point that claims self._syncing
+        (_start_push(), _poll_tick(), _media_poll_tick()), so a push
+        that had to wait behind, say, a poll-triggered resync goes out
+        as soon as that resync's chain finishes, not on the next poll
+        tick.
+
+        Deliberately *one* flush attempt, not a "keep looping while the
+        queue is non-empty" recursion: _flush_pending_pushes_async()
+        already drains the queue as far as it currently can in that one
+        call (see its own docstring), stopping naturally at the first
+        still-undeliverable entry -- if it stopped there, the queue is
+        non-empty for exactly that reason, and calling it again
+        immediately would just retry the identical failing entry,
+        synchronously, forever. An earlier version of this method did
+        exactly that (loop while non-empty) and deadlocked every test
+        (and would have hung a real session) the moment any push failed
+        for a connectivity reason, since the same queued entry made the
+        post-flush check non-empty again on every pass. A push that
+        arrives genuinely *during* this flush (a concurrent edit while
+        self._syncing is still held) is not lost, just not flushed
+        immediately -- it waits for the next chain's own completion, or
+        the next poll tick, same as any other queued push today.
+        """
+
+        def finish(*args):
+            if self._get_metadata("pending_pushes", default=[]):
+                # self._syncing stays True until the flush -- a
+                # continuation of this same chain, not a new operation
+                # free to race whatever comes next -- itself finishes.
+                def done_flushing(_result):
+                    self._syncing = False
+                    if on_done is not None:
+                        on_done(*args)
+
+                self._flush_pending_pushes_async(done_flushing, done_flushing)
+                return
+            self._syncing = False
+            if on_done is not None:
+                on_done(*args)
+
+        return finish
+
+    def _push_payload_async(
+        self, payload, on_done, on_error, undo=False, is_retry=False, message=None
+    ):
+        """Push a change-list payload to the server, handling a rejected
+        push (conflict or otherwise) the same way regardless of whether
+        it came from a plain commit, an undo, or a redo. The async
+        counterpart of the old (pump-based) _push_payload(): the network
+        call runs entirely on io_runner (see taskrunner.py) -- no
+        self.dbapi touch anywhere in this method or anything it
+        schedules.
+
+        Caller (_start_push()) already owns self._syncing; this method
+        and everything it chains into never touches that flag itself --
+        see that method's docstring.
+
+        is_retry marks a push that is itself the replay
+        _retry_after_conflict() made from an earlier conflict -- a
+        second conflict on that replay is logged and dropped rather than
+        retried again, so a genuinely hot object can't send this into an
+        unbounded retry loop.
+
+        ``message`` is forwarded to push_transaction() as-is -- see its
+        docstring.
+        """
+        if not payload:
+            on_done(None)
+            return
+        started = monotonic()
+
+        def do_push():
+            # io_runner: pure network, no self.dbapi touch.
+            # _use_background_push()'s own network call
+            # (supports_background_transactions()) belongs here too, not
+            # on the main thread -- see that method's docstring.
+            background = self._use_background_push(payload)
+            LOG.debug(
+                "push: %d change(s) (%s)%s%s",
+                len(payload),
+                ", ".join(sorted({entry["type"] for entry in payload})),
+                " undo" if undo else "",
+                " background" if background else "",
+            )
+            self.web_client.push_transaction(
+                self._payload_for_server(payload, undo),
+                undo=undo,
+                background=background,
+                message=message,
+            )
+            LOG.debug("push: accepted in %.2fs", monotonic() - started)
+
+        def on_pushed(_result):
+            on_done(None)
+
+        def on_push_error(exc):
+            if isinstance(exc, WebApiPushConflict):
+                LOG.warning(
+                    "Server rejected %d local change(s): the object(s) "
+                    "changed server-side since the local mirror last "
+                    "synced. Resyncing the mirror from the server now.",
+                    len(payload),
+                )
+
+                def on_resync_error(resync_exc):
+                    LOG.error(
+                        "Resync after a push conflict also failed.",
+                        exc_info=resync_exc,
+                    )
+                    on_error(resync_exc)
+
+                # A full resync, not the incremental history feed: a
+                # conflict can be caused by a server-side change the
+                # history feed cannot describe at all -- a bulk import
+                # runs entirely outside gramps-web-api's own transaction
+                # log (see _resync_after_conflict_async()'s docstring),
+                # ordinary server administration rather than an edge
+                # case -- and a totals check can't catch a content-only
+                # change to an already-known object either. See
+                # _resync_after_conflict_async() for why nothing cheaper
+                # is trustworthy here.
+                self._resync_after_conflict_async(
+                    on_done=lambda _: self._after_conflict_resync(
+                        payload, undo, is_retry, on_done, on_error, message=message
+                    ),
+                    on_error=on_resync_error,
+                )
+                return
+            if not _is_retryable_push_error(exc):
+                # A permission/payload rejection is not going to start
+                # working on its own; queueing it would retry it on every
+                # poll forever and eventually push real, retryable work
+                # out of the capped queue.
+                LOG.error(
+                    "Server permanently rejected %d local change(s) (%s). "
+                    "They will not be retried, and the local mirror has "
+                    "drifted from the server for those object(s).",
+                    len(payload),
+                    exc,
+                )
+                # on_error() first, not after: it's what releases
+                # self._syncing (via _finish_async_op(), the top-level
+                # caller's wrapped completion handler) -- calling it
+                # before the note's own local commit means that commit's
+                # own push (transaction_commit() -> _start_push()) finds
+                # self._syncing already clear and can go out right away,
+                # instead of finding it still held by this very chain and
+                # being deferred to _queue_pending_push() for no reason.
+                on_error(exc)
+                if not _is_message_note_push(message):
+                    self._record_undelivered_push_notes(
+                        payload, f"server permanently rejected it ({exc})"
+                    )
+                return
+            # LOG.exception() (used by the old synchronous _push_payload())
+            # relies on sys.exc_info(), which has nothing to show from
+            # inside a callback outside any active except block -- exc is
+            # passed explicitly via exc_info instead, same as elsewhere
+            # in this file's ..._async() error handlers.
+            LOG.error(
+                "Failed to push %d local change(s) to the server; queued "
+                "for retry on the next successful contact with the server.",
+                len(payload),
+                exc_info=exc,
+            )
+            self._queue_pending_push(payload, undo=undo, message=message)
+            on_error(exc)
+
+        self.io_runner.run(
+            do_push, self._guarded(on_pushed), self._guarded(on_push_error)
+        )
+
+    def _log_conflict_field_diffs(self, payload):
+        """Diagnostic aid, called right after a resync has brought the
+        local mirror to the server's true current state (see
+        _after_conflict_resync(), which calls this before deciding
+        retry-vs-give-up either way): for each conflicting entry, diff
+        its pre-conflict "old" snapshot against the now-current local
+        copy of that same object and LOG.warning() what actually
+        differs, via _walk_conflict_diff().
+
+        Answers a question the server's own 400 never does -- which
+        field disagreed -- for TODO.md's open "spurious first-push
+        conflict on a freshly-resynced mirror, no other editor involved"
+        gap. A delete entry or one whose "old" is already None (a fresh
+        add) has nothing to diff against; skipped, same as
+        _record_undelivered_push_notes() skips a delete for the same
+        reason.
+
+        Returns True if any entry differed, False if every comparable
+        entry matched its resynced copy exactly.
+        """
+        any_diff = False
+        for entry in payload:
+            if entry["type"] == "delete" or entry.get("old") is None:
+                continue
+            key = CLASS_TO_KEY_MAP.get(entry["_class"])
+            if key is None:
+                continue
+            name = KEY_TO_NAME_MAP[key]
+            handle = entry["handle"]
+            if not getattr(self, f"has_{name}_handle")(handle):
+                continue
+            current = getattr(self, f"get_{name}_from_handle")(handle)
+            current_dict = object_to_dict(current)
+            if diff_items(entry["_class"], entry["old"], current_dict):
+                any_diff = True
+                _walk_conflict_diff(
+                    entry["_class"], handle, entry["old"], current_dict
+                )
+        return any_diff
+
+    def _after_conflict_resync(
+        self, payload, undo, is_retry, on_done, on_error, message=None
+    ):
+        """_push_payload_async()'s continuation once
+        _resync_after_conflict_async() has brought the local mirror back
+        to the server's true current state: replay the original edit on
+        top of it (_retry_after_conflict()), unless this is already a
+        retry or an undo/redo -- see _push_payload_async()'s docstring
+        on is_retry.
+
+        _retry_after_conflict()'s own DbTxn body is 100% local DB work
+        (no network), so it runs as one runner (main-thread) step --
+        run_retry() below. What it triggers on exit
+        (DbTxn.__exit__ -> transaction_commit() -> _start_push(...,
+        is_retry=True)) is a *nested* push, itself asynchronous;
+        run_retry()'s own runner.run() completing therefore does NOT
+        mean this chain is done, only that the local commit landed. The
+        chain's real on_done/on_error are stashed on self
+        (self._retry_chain_done/_retry_chain_error) so that nested
+        _start_push() call can find and use them instead of treating the
+        retry's local commit as the finish line -- see _start_push()'s
+        docstring for the bug this specifically fixes.
+        """
+        self._log_conflict_field_diffs(payload)
+
+        def give_up():
+            LOG.warning(
+                "Giving up on %d local change(s) after a repeated or "
+                "undo/redo conflict; the local mirror was not resent to "
+                "the server.",
+                len(payload),
+            )
+            # Same "never let a discarded edit vanish without a trace"
+            # commitment as every other give-up point in this file (a
+            # fresh push's non-retryable rejection, a queued push that
+            # conflicts or is non-retryable on replay, a queue eviction --
+            # see _record_undelivered_push_notes()'s own docstring). This
+            # one was the sole exception: a retry (or undo/redo) that
+            # conflicts *again* dropped the payload with nothing but this
+            # log line -- confirmed live (live_tests/
+            # test_live_repeated_conflict_note_trail.py) to leave zero
+            # trace on the server-side object at all, not even a Note.
+            # _is_message_note_push() still guards this the same way it
+            # guards every other call site, so a note-commit that itself
+            # loses this same race doesn't recurse.
+            if not _is_message_note_push(message):
+                self._record_undelivered_push_notes(
+                    payload,
+                    "it conflicted with the server's current data a second "
+                    "time and could not be reconciled automatically",
+                )
+            # on_error, not on_done: the edit did not reach the server.
+            # For a retry, that tells run_retry()'s chain_error to drop
+            # its deferred conflict notes; for a top-level undo/redo the
+            # two are the same _finish_async_op() wrapper anyway.
+            on_error(None)
+
+        if undo or is_retry:
+            # undo/redo: retrying against data that changed underneath it
+            # is a murkier case (are we replaying the reversal, or the
+            # original edit?) than retrying a plain commit -- left as
+            # resync-and-give-up unconditionally, same as before this
+            # feature existed; see the module docstring.
+            #
+            # is_retry: the retry's own nested push conflicted *again*.
+            # A "retry harder for a provably safe, collision-free edit"
+            # policy was attempted here (see git history) and reverted:
+            # repeatedly reapplying the *same* fixed payload against a
+            # local mirror that a previous attempt already merged into is
+            # not equivalent to a fresh retry from the original intent,
+            # and produced real, incorrect "genuine collision" reports on
+            # the second attempt for a purely list-additive edit (an
+            # already-merged attribute re-diffed against the same
+            # original "new" was misread as two different, conflicting
+            # items) -- confirmed while building the regression tests for
+            # it, not just a hypothetical concern. Giving up after one
+            # retry, unconditionally, is the safe, correct behavior until
+            # a real fix computes a fresh "new" for each additional
+            # attempt instead of resubmitting a stale one.
+            give_up()
+            return
+
+        self._schedule_retry(payload, undo, on_done, on_error, message=message)
+
+    def _schedule_retry(self, payload, undo, on_done, on_error, message=None):
+        """_after_conflict_resync()'s "actually run the retry attempt"
+        step.
+
+        This call is itself already known-valid (reached only via a
+        self._guarded() callback further up the chain), but scheduling
+        run_retry() below is a fresh hop through the main loop
+        (self.runner.run() -> another GLib.idle_add) -- close() could
+        still run in that narrow gap before run_retry() actually
+        executes. Re-checked inside run_retry() itself, same reasoning
+        as _full_resync_async()'s rebuild() -- see that method's comment
+        for the fuller explanation of why a fresh self._guarded()
+        wrapping alone can't catch this (it only stops the *outcome*
+        from being delivered, not the DbTxn from running in the first
+        place).
+        """
+        run_id = self._run_id
+
+        def on_retry_db_error(exc):
+            # _retry_after_conflict()'s own DbTxn body (data_to_object(),
+            # commit_<type>(), the merge) is what can raise here -- its
+            # nested transaction_commit() -> _start_push() call handles a
+            # rejected push itself and does not re-raise, so reaching
+            # this means the DbTxn body never finished and aborted
+            # without committing. Nothing local to lose; queue the
+            # original payload the same as any other connectivity
+            # failure.
+            LOG.warning(
+                "Could not replay %d local change(s) after a conflict "
+                "(%s); queued for retry on the next successful contact "
+                "with the server.",
+                len(payload),
+                exc,
+            )
+            self._queue_pending_push(payload, undo=undo, message=message)
+            on_error(exc)
+
+        def run_retry():
+            if self._run_id != run_id:
+                # The tree closed between this being scheduled and
+                # actually running. No resource to clean up here (unlike
+                # _full_resync_async()'s temp file) -- just don't touch
+                # self.dbapi, which may already be closed.
+                LOG.debug("retry: tree closed before it ran; discarding it")
+                return
+            # Read synchronously by _start_push() inside this same call
+            # (via DbTxn.__exit__ -> transaction_commit()), before the
+            # finally below clears it -- same single-callback-body
+            # ordering guarantee as self._retrying itself.
+            #
+            # DbTxn.__exit__() calls transaction_commit() unconditionally
+            # on a clean exit (txn.py), whether or not the transaction's
+            # body actually committed anything -- so _start_push(...,
+            # is_retry=True) is *always* reached exactly once here, never
+            # skipped. Its own "if not payload:" branch already handles
+            # the all-entries-were-no-ops case by calling
+            # self._retry_chain_done(None) itself; there is deliberately
+            # no fallback completion call here after
+            # _retry_after_conflict() returns -- an earlier version of
+            # this method had one, on the mistaken assumption that an
+            # empty commit skips transaction_commit() entirely, and it
+            # fired unconditionally, completing the chain the moment the
+            # *local* commit landed regardless of whether the recursive
+            # push it had just scheduled was still genuinely in flight --
+            # reintroducing the exact premature-completion bug
+            # _start_push()'s docstring describes. Only a real exception
+            # from _retry_after_conflict() itself (caught below via
+            # on_retry_db_error) is a valid reason for this chain to stop
+            # here instead of via that recursive push's own eventual
+            # on_done/on_error.
+            # Conflict notes wait for this retry's own push to resolve:
+            # sent any earlier, a note's "old" snapshot of the object
+            # already carries the retry's not-yet-landed edit, so the
+            # server rejects it as changed -- confirmed live
+            # (test_live_repeated_conflict_note_trail.py, conflict-diff
+            # on attribute_list). On failure -- including
+            # _after_conflict_resync()'s give-up, which leaves its own
+            # undelivered-edit note -- they're dropped: the merge they
+            # describe never reached the server, and a connectivity
+            # failure's queued replay would conflict the same way.
+            deferred_notes = []
+            notes_handled = []
+
+            def chain_done(result):
+                if deferred_notes and not notes_handled:
+                    notes_handled.append(True)
+                    self._record_conflict_notes(list(deferred_notes))
+                on_done(result)
+
+            def chain_error(exc):
+                notes_handled.append(True)
+                on_error(exc)
+
+            self._retry_chain_done, self._retry_chain_error = chain_done, chain_error
+            try:
+                self._retry_after_conflict(payload, deferred_notes=deferred_notes)
+            finally:
+                self._retry_chain_done = None
+                self._retry_chain_error = None
+
+        self.runner.run(
+            run_retry,
+            # No-op: the chain's real completion fires from inside
+            # run_retry() itself (via the nested push's on_done/
+            # on_error), not from runner.run()'s own on_success --
+            # run_retry() returning just means the *local* commit
+            # landed, not that the chain is done.
+            self._guarded(lambda _: None),
+            self._guarded(on_retry_db_error),
+        )
+
+    def _use_background_push(self, payload):
+        """Whether to ask the server to process this payload as a
+        background task rather than inline -- see BACKGROUND_PUSH_THRESHOLD
+        and webapi_client.push_transaction()'s ``background`` param.
+
+        A server that can't do it (too old, or its version can't be
+        determined) always answers False. A failure asking is not worth
+        aborting the push over: fall back to the synchronous path, which
+        works everywhere.
+        """
+        if len(payload) < BACKGROUND_PUSH_THRESHOLD:
+            return False
+        try:
+            return self.web_client.supports_background_transactions()
+        except _CONNECTION_ERRORS:
+            LOG.debug(
+                "Could not determine server support for background "
+                "transactions; pushing synchronously.",
+                exc_info=True,
+            )
+            return False
+
+    def _queue_pending_push(self, payload, undo=False, message=None):
+        """Persist a payload whose push failed for a connectivity reason,
+        so _flush_pending_pushes() can retry it later -- including after a
+        close()/reopen, since this goes through _set_metadata() (the same
+        mechanism sync_last_id already uses) rather than an in-memory
+        list. See the module docstring.
+
+        ``message`` (see push_transaction()'s docstring) is persisted
+        alongside the payload so a queued push, once retried, still shows
+        up in the server's history under its original description rather
+        than falling back to "Raw transaction".
+
+        Recording a note for an evicted entry (see
+        _record_undelivered_push_notes()) is its own local edit, which
+        can itself land right back here if its push fails for a
+        connectivity reason too -- so the trimmed queue is persisted
+        *before* any of that runs, not after. Recording first would let
+        that nested call read this method's not-yet-persisted ``pending``
+        via its own _get_metadata() call, then overwrite it with a stale
+        copy missing whatever the nested call just queued, once this
+        call's own _set_metadata() finally runs.
+        """
+        pending = self._get_metadata("pending_pushes", default=[])
+        pending.append({"payload": payload, "undo": undo, "message": message})
+        evicted_entries = []
+        if len(pending) > MAX_PENDING_PUSHES:
+            dropped = len(pending) - MAX_PENDING_PUSHES
+            LOG.error(
+                "Pending-push queue exceeded %d entries; dropping the %d "
+                "oldest. Those local change(s) will not reach the server -- "
+                "the local mirror has permanently drifted and needs a manual "
+                "reconciliation against it.",
+                MAX_PENDING_PUSHES,
+                dropped,
+            )
+            evicted_entries = pending[:dropped]
+            pending = pending[dropped:]
+        self._set_metadata("pending_pushes", pending)
+        for evicted in evicted_entries:
+            if not _is_message_note_push(evicted.get("message")):
+                self._record_undelivered_push_notes(
+                    evicted["payload"],
+                    "it was evicted from the local retry queue after too "
+                    "many undelivered changes accumulated",
+                )
+
+    def _flush_pending_pushes_async(self, on_done, on_error):
+        """Retry queued pushes that previously failed for a connectivity
+        reason, oldest first, stopping at the first that still can't be
+        delivered -- see the module docstring on why this doesn't skip
+        ahead past a stuck entry.
+
+        A queued entry that comes back as a *conflict* rather than a
+        connectivity failure is dropped rather than retried forever: by
+        the time it is replayed the server has moved on, and
+        _push_payload_async()'s resync-and-merge path needs an "old"
+        snapshot contemporaneous with the edit, which a queued payload
+        no longer has. An entry the server permanently rejects (see
+        _is_retryable_push_error()) is likewise dropped rather than left
+        to block the queue forever -- permissions may well have changed
+        between queueing and now.
+
+        Stopping early (a still-undeliverable entry) or exhausting the
+        queue both call on_done, not on_error: neither is a failure of
+        this method itself, and its caller (currently only
+        _finish_async_op(), via a fresh self._get_metadata() check each
+        time it re-wraps itself) always treats "flushed as far as
+        possible" as success. Reads the queue itself (rather than
+        taking it as a parameter) for the same reason _flush_pending_
+        pushes() always did: called from more than one place, each
+        needing the current persisted state, not a snapshot from
+        whenever the caller happened to start.
+        """
+        pending = self._get_metadata("pending_pushes", default=[])
+        if not pending:
+            on_done(None)
+            return
+        LOG.info("Retrying %d queued push(es) to the server.", len(pending))
+        self._flush_one_pending_push(pending, on_done, on_error)
+
+    def _flush_one_pending_push(self, pending, on_done, on_error):
+        """_flush_pending_pushes_async()'s per-entry step. ``pending`` is
+        mutated in place (entries popped off the front as they're
+        delivered or dropped) and persisted once this recursion bottoms
+        out, exactly the way the old synchronous while-loop this
+        replaces did with its own local variable.
+
+        Recording a note for a dropped entry below (see
+        _record_undelivered_push_notes()) is its own local edit, which
+        could in principle land right back in _queue_pending_push() if
+        its own push fails for a connectivity reason -- and because this
+        method only persists ``pending`` once the whole recursion
+        bottoms out, not after every pop (see above), that nested call's
+        own _set_metadata() could be overwritten by this one's once it
+        finally runs, losing the note-push's own queued retry. Unlike
+        the same risk in _queue_pending_push() itself (persist-before-
+        record there, since it has one write to reorder around), fixing
+        it here would mean persisting after every single pop instead of
+        once at the end -- a real behavior change to well-tested
+        existing logic for what is, worst case, one best-effort
+        diagnostic note lost to a narrow double-failure race, not the
+        original edit itself (that loss is already logged unconditionally
+        either way). Left as a known, acceptable gap rather than
+        rearchitected for it.
+        """
+        if not pending:
+            self._set_metadata("pending_pushes", pending)
+            LOG.debug("queue: %d push(es) still pending after the flush", len(pending))
+            on_done(None)
+            return
+        entry = pending[0]
+
+        def do_push():
+            # io_runner: pure network, no self.dbapi touch. See
+            # _push_payload_async()'s do_push() for why
+            # _use_background_push() belongs here too.
+            background = self._use_background_push(entry["payload"])
+            self.web_client.push_transaction(
+                self._payload_for_server(entry["payload"], entry.get("undo", False)),
+                undo=entry.get("undo", False),
+                background=background,
+                message=entry.get("message"),
+            )
+
+        def pop_and_continue():
+            pending.pop(0)
+            self._flush_one_pending_push(pending, on_done, on_error)
+
+        def on_pushed(_result):
+            pop_and_continue()
+
+        def on_push_error(exc):
+            if isinstance(exc, WebApiPushConflict):
+                # A resync-then-merge treatment (the same one a fresh
+                # conflict gets, via _after_conflict_resync()) was tried
+                # here and reverted: it's genuinely unsafe as a general
+                # queue-flush policy. The reconciliation it triggers can
+                # itself commit further local objects (tag creation,
+                # note attachment) whose *own* pushes can land back in
+                # this exact queue while _flush_one_pending_push()'s own
+                # recursion is still unwinding over the same closure-
+                # captured ``pending`` list -- confirmed to actually
+                # happen (a live rerun produced a real "pop from empty
+                # list" crash from the reentrant pop, and a runaway
+                # cascade of "give up" notes about the tag-creation
+                # sub-commits' own failed pushes, each one _is_message_
+                # note_push() doesn't recognize as a note-commit itself).
+                # Dropping is the honest outcome for the general case:
+                # a queued payload's "old" snapshot is stale by
+                # definition, so a merge here can't reliably tell a
+                # genuine collision apart from an uncontested one either.
+                # See _start_push()'s own comment for the *narrower* fix
+                # that actually closes the gap this was trying to solve
+                # (a note-commit specifically getting queued and lost)
+                # without this general reentrancy hazard: a note-record
+                # push no longer queues behind self._syncing in the first
+                # place, so it essentially never reaches this branch.
+                LOG.warning(
+                    "A queued push of %d change(s) conflicts with the "
+                    "server's current data and cannot be replayed safely; "
+                    "dropping it. The local mirror has drifted from the "
+                    "server for those object(s).",
+                    len(entry["payload"]),
+                )
+                if not _is_message_note_push(entry.get("message")):
+                    self._record_undelivered_push_notes(
+                        entry["payload"],
+                        "it conflicted with the server's current data and "
+                        "could not be replayed safely",
+                    )
+                pop_and_continue()
+                return
+            if _is_retryable_push_error(exc):
+                LOG.warning(
+                    "Still unable to deliver %d queued push(es); will retry.",
+                    len(pending),
+                )
+                self._set_metadata("pending_pushes", pending)
+                LOG.debug(
+                    "queue: %d push(es) still pending after the flush", len(pending)
+                )
+                on_done(None)
+                return
+            LOG.error(
+                "Server permanently rejected a queued push of %d change(s) "
+                "(%s); dropping it. The local mirror has drifted from the "
+                "server for those object(s).",
+                len(entry["payload"]),
+                exc,
+            )
+            if not _is_message_note_push(entry.get("message")):
+                self._record_undelivered_push_notes(
+                    entry["payload"], f"server permanently rejected it ({exc})"
+                )
+            pop_and_continue()
+
+        self.io_runner.run(
+            do_push, self._guarded(on_pushed), self._guarded(on_push_error)
+        )
+
+    def _retry_after_conflict(self, payload, deferred_notes=None):
+        """Reapply each locally-intended change as a fresh local edit --
+        see the module docstring's write-through section. An add/update
+        whose object still exists is combined with the current object via
+        _merge_or_overwrite() rather than blindly replacing it.
+
+        Callers are responsible for making sure the local mirror already
+        holds the server's true current state for whatever this payload
+        touches, *before* this runs: DBAPI computes this retry's own "old"
+        snapshot from whatever is stored locally at commit time
+        (_commit_base()'s _get_raw_data() call), so a stale mirror means
+        the retry pushes the same stale "old" as the original failed push
+        and is rejected again identically, no matter how correct its
+        "new" is. _push_payload_async()'s conflict handler does this with
+        a full resync (_resync_after_conflict_async()) before calling
+        here (via _after_conflict_resync()); see that method's docstring
+        for why nothing cheaper is trustworthy. This is only ever reached
+        via that path now -- a local batch operation's own reconciled
+        changes (_reconcile_batch_commit()) push directly through
+        _start_push(), landing here only if that push itself conflicts,
+        the same as any other edit.
+
+        Runs as one ordinary (non-batch) DbTxn, so it goes through the
+        normal transaction_commit() -> _start_push() path again -- this
+        time with an "old" snapshot that matches the local mirror's
+        current (freshly-resynced, for the conflict path) state, so it
+        will only be rejected again if something else changed server-side
+        in the brief window since then. _after_conflict_resync() runs
+        this as one runner (main-thread) step, since it's 100% local DB
+        work with no network of its own.
+
+        Also logs a diagnostic warning, separately from
+        _conflict_summary_lines()'s notes, whenever the just-resynced
+        server copy turns out to be byte-for-byte identical (by
+        diff_items()'s own rules) to the "old" the original push was
+        rejected against -- a signal the rejection may have been
+        transient rather than a real, lasting server-side edit. See the
+        comment at that check for why silence from
+        _conflict_summary_lines() alone can't be read as that signal
+        (an uncontested list-additive edit is silent too).
+
+        Any genuine conflict _merge_or_overwrite() had to resolve
+        automatically -- a discarded scalar field, a demoted primary
+        name, an actively-resolved field like Citation confidence, or a
+        pruned dangling reference (see _conflict_summary_lines()) -- is
+        collected here and handed to _record_conflict_notes()
+        afterwards, as its own separate transaction -- not inside the
+        ``with DbTxn`` below, so this retry's own commit stays exactly
+        what it was before: one object per conflicting entry, nothing
+        else. An uncontested edit, or two different items both
+        surviving a list union, produces no lines and is never recorded
+        -- see TODO.md's "Only do for CONFLICTS" note.
+
+        ``deferred_notes``, if given, is a list this fills in *instead*
+        of recording anything -- _schedule_retry()'s run_retry() passes
+        one so the notes wait until this retry's own push has resolved.
+        Filled during the loop, not after: the push this DbTxn's exit
+        starts can resolve before this method returns (synchronously,
+        under InlineTaskRunner), and the caller reads it then.
+        """
+        self._retrying = True
+        conflicts = deferred_notes if deferred_notes is not None else []
+        try:
+            with DbTxn(_("Retry local change after server conflict"), self) as trans:
+                for entry in payload:
+                    key = CLASS_TO_KEY_MAP.get(entry["_class"])
+                    if key is None:
+                        continue
+                    name = KEY_TO_NAME_MAP[key]
+                    handle = entry["handle"]
+                    has_handle = getattr(self, f"has_{name}_handle")
+                    if entry["type"] == "delete":
+                        if has_handle(handle):
+                            getattr(self, f"remove_{name}")(handle, trans)
+                    else:
+                        obj = data_to_object(entry["new"])
+                        if has_handle(handle):
+                            current = getattr(self, f"get_{name}_from_handle")(handle)
+                            old_data = entry.get("old")
+                            if old_data is not None and not diff_items(
+                                entry["_class"], old_data, object_to_dict(current)
+                            ):
+                                # The server rejected the original push as
+                                # "Object has changed", yet the mirror this
+                                # very resync just downloaded is identical
+                                # (by the server's own diff_items() rules --
+                                # see push_transaction()'s docstring on why
+                                # they must agree) to what we sent as "old".
+                                # A real edit merges here with zero lines
+                                # too (list-additive changes never conflict
+                                # -- see _conflict_summary_lines()'s own
+                                # docstring), so that silence alone doesn't
+                                # distinguish "nothing to report" from "this
+                                # rejection looks spurious in hindsight" --
+                                # this does, by checking the one comparison
+                                # that actually matters directly.
+                                LOG.warning(
+                                    "Conflict retry for %s %s: the server "
+                                    "rejected the original push as changed, "
+                                    "but the freshly-resynced server copy "
+                                    "is identical to what was sent as "
+                                    '"old" -- the rejection may have been '
+                                    "transient (a change already reverted "
+                                    "or reapplied before this resync) "
+                                    "rather than a lasting server-side edit.",
+                                    entry["_class"],
+                                    handle,
+                                )
+                            pruned = []
+                            merged = _merge_or_overwrite(
+                                current, obj, self, old_data=old_data, pruned=pruned
+                            )
+                            lines = _conflict_summary_lines(
+                                old_data, current, obj, merged, pruned
+                            )
+                            if lines:
+                                conflicts.append((entry["_class"], name, handle, lines))
+                            obj = merged
+                        getattr(self, f"commit_{name}")(obj, trans)
+        finally:
+            self._retrying = False
+        if conflicts and deferred_notes is None:
+            self._record_conflict_notes(conflicts)
+
+    def _get_or_create_tag(self, name):
+        """Look up a Tag by name, creating it if this is the first time
+        it's needed here -- the same lookup-or-create gramps-connect's
+        own notesApi.ts does for its "message"/"todo-open" tags, so both
+        sides converge on the same Tag object regardless of which one
+        creates it first.
+
+        Runs its own DbTxn rather than sharing the caller's: tag
+        creation is a one-time, idempotent event (a second call finds it
+        via get_tag_from_name() and never reaches the create branch
+        again), not part of what any particular conflict recording is
+        "about".
+        """
+        tag = self.get_tag_from_name(name)
+        if tag is not None:
+            return tag
+        tag = Tag()
+        tag.set_handle(create_id())
+        tag.set_name(name)
+        with DbTxn(_("Create tag"), self) as trans:
+            self.commit_tag(tag, trans)
+        return tag
+
+    def _record_conflict_notes(self, conflicts, _retry_on_conflict=True):
+        """Attach one gramps-connect-style "message" Note per conflicted
+        object, recording exactly what _retry_after_conflict() had to
+        resolve automatically -- see the module docstring's "silently
+        losing the discarded value is not" paragraph and
+        _conflict_summary_lines()'s own docstring for what counts.
+
+        ``conflicts`` is a list of (obj_class, name, handle, lines) from
+        _retry_after_conflict(), where lines is
+        _conflict_summary_lines()'s own list of ready-made, human-
+        readable strings -- already filtered to genuine conflicts only,
+        nothing left for this method to decide.
+
+        ``_retry_on_conflict`` (default True) stashes ``conflicts`` on
+        self._note_retry_conflicts right before the note-attach DbTxn
+        below, for _start_push()/_send_note_payload_best_effort() to use
+        if that specific push conflicts -- see that method's docstring
+        for what the retry actually does and why it has to rebuild the
+        note rather than just resend it. False is _send_note_payload_
+        best_effort()'s own recursive call, once that retry has already
+        happened once: this method doesn't loop on its own, the caller
+        bounds it to a single attempt.
+
+        Runs as its own, separate local transaction, called only after
+        _retry_after_conflict()'s own DbTxn has already committed --
+        deliberately not folded into that one, so the retry's own commit
+        stays exactly what it always was: one object per conflicting
+        entry, nothing else (see that method's docstring). This one goes
+        through the completely ordinary transaction_commit() ->
+        _start_push() path like any other local edit, under
+        self._recording_note so transaction_commit()'s own missing-
+        write-permission rejection (see its docstring) lets it through
+        regardless -- and safe even if *this* push itself hits a
+        conflict, since attaching a note is a list-valued change
+        merge() already unions correctly (unlike the scalar edit this
+        note exists to record in the first place).
+
+        Also forces self._retrying False for the duration, saving and
+        restoring whatever it was: with an inline (synchronous) runner --
+        every unit test in this file, and in effect on a very fast
+        connection -- _retry_after_conflict()'s own DbTxn.__exit__() ->
+        transaction_commit() -> ... -> a give-up that calls here (see
+        _after_conflict_resync()) all happen nested *inside* that same
+        DbTxn's __exit__ call, before its own `finally: self._retrying =
+        False` ever runs. Left alone, transaction_commit() reads
+        self._retrying (still True from the *outer* retry) for this
+        method's own tag/note commits and treats them as
+        is_retry=True -- stealing the outer retry chain's own
+        self._retry_chain_done/_retry_chain_error instead of completing
+        independently, and skipping the queue-vs-immediate routing
+        _start_push() would otherwise apply. This bookkeeping is not
+        itself a conflict retry no matter what call stack it happens to
+        run on top of.
+        """
+        self._recording_note = True
+        was_retrying = self._retrying
+        self._retrying = False
+        try:
+            message_tag = self._get_or_create_tag(MESSAGE_TAG_NAME)
+            todo_tag = self._get_or_create_tag(MESSAGE_TODO_OPEN_TAG_NAME)
+            # Scoped to just this DbTxn's own push -- not set any earlier
+            # (the tag-creation DbTxns above go through this same
+            # self._recording_note routing too, and would otherwise
+            # consume it first; see self._note_retry_conflicts' own
+            # docstring) -- and always cleared after, win or lose, so a
+            # later unrelated note-attach push never inherits it.
+            self._note_retry_conflicts = conflicts if _retry_on_conflict else None
+            with DbTxn(_message_note_description(), self) as trans:
+                for obj_class, name, handle, lines in conflicts:
+                    get_from_handle = getattr(self, f"get_{name}_from_handle", None)
+                    if get_from_handle is None:
+                        continue
+                    try:
+                        obj = get_from_handle(handle)
+                    except HandleError:
+                        continue  # gone locally by the time this runs
+                    if not hasattr(obj, "add_note"):
+                        continue  # e.g. Tag -- nothing to attach a note to
+                    summary = "; ".join(lines)
+                    note = Note()
+                    note.set_handle(create_id())
+                    note.set_gramps_id(self.find_next_note_gramps_id())
+                    note.set_type(NoteType.GENERAL)
+                    note.set(f"{MESSAGE_NOTE_AUTHOR}: {obj_class} -- {summary}")
+                    note.add_tag(message_tag.handle)
+                    note.add_tag(todo_tag.handle)
+                    self.commit_note(note, trans)
+                    obj.add_note(note.handle)
+                    getattr(self, f"commit_{name}")(obj, trans)
+        finally:
+            self._recording_note = False
+            self._retrying = was_retrying
+            # Defensive: normally already read-and-cleared by
+            # _start_push() the moment the DbTxn above committed. Only
+            # left set here if that commit's push took some other route
+            # entirely (e.g. self._syncing was already clear, so it went
+            # through the ordinary _push_payload_async() path instead --
+            # which has its own, already-correct conflict handling and
+            # never looks at this attribute).
+            self._note_retry_conflicts = None
+
+    def _record_undelivered_push_notes(self, payload, reason):
+        """Attach a gramps-connect-style "message" Note to every add/
+        update entry in payload whose object still exists locally,
+        recording that this local edit will never reach the server, and
+        why -- reusing _record_conflict_notes()'s own Note-attachment
+        machinery (same tags, same separate-transaction timing, same
+        reasoning) rather than a second implementation of it. See
+        TODO.md gap #2/#3: local and server permanently diverge for
+        that object the moment this runs, exactly the kind of silent
+        loss the "never silent, never blocking" design principle exists
+        to close, just from a delivery failure rather than a merge
+        conflict.
+
+        Called from every point elsewhere in this file that gives up on
+        a local edit ever reaching the server: a non-retryable
+        rejection (_push_payload_async()'s on_push_error), a queued
+        push that now conflicts or is itself non-retryable on replay
+        (_flush_one_pending_push()'s on_push_error), and a pending-push
+        queue eviction (_queue_pending_push()).
+
+        A delete entry has no local object left to attach a note to --
+        skipped here, same as _record_conflict_notes() skips a handle
+        that's gone by the time it runs; only the caller's own log line
+        records that one.
+        """
+        conflicts = []
+        for entry in payload:
+            if entry["type"] == "delete":
+                continue  # nothing local left to attach a note to
+            key = CLASS_TO_KEY_MAP.get(entry["_class"])
+            if key is None:
+                continue
+            name = KEY_TO_NAME_MAP[key]
+            conflicts.append(
+                (
+                    entry["_class"],
+                    name,
+                    entry["handle"],
+                    [f"local edit could not be synced to the server: {reason}"],
+                )
+            )
+        if conflicts:
+            self._record_conflict_notes(conflicts)
+
+    def _reimport_neutralizing_local_settings(self, tmp_path, import_user):
+        """importData(self, tmp_path, import_user), with every local
+        Gramps setting known to affect what ImportXml does neutralized
+        for the duration of the call -- ID Formats and "Tag on import"
+        -- so a bootstrap or resync reproduces the server's data
+        exactly, regardless of what this *local* Gramps installation
+        happens to have configured. Restored in the finally either way.
+
+        This reimport's only purpose is to mirror the server -- unlike
+        an ordinary user-initiated Import (GEDCOM, someone else's
+        Gramps XML into an established tree), where every one of these
+        settings is exactly the point. TODO.md gaps 7 and 8 are each a
+        real report of one of these leaking into this addon's own
+        internal resync/bootstrap mechanism, not a real Import a user
+        asked for:
+
+        - **ID Formats** (Edit > Preferences > ID Formats) -- gap 7,
+          reported live: a local "I%08d" default against a server using
+          plain "I%04d" silently widened every gramps_id, permanently,
+          on every bootstrap and resync (`ImportXml.legalize_id()` ->
+          `db.id2user_format()`, built from `DbGeneric.
+          set_person_id_prefix()` et al). Neutralized by setting every
+          `*_prefix` to a bare `"<letter>%d"` --
+          `DbGeneric.__id2user_format()`'s regex only recognizes a
+          zero- or space-padded width flag (`"%04d"`, `"% 4d"`, ...),
+          so a bare `"%d"` falls through to its identity closure_func()
+          and every imported gramps_id passes through unchanged.
+        - **"Tag on import"** (`preferences.tag-on-import`/
+          `-format`, default off) -- gap 8, confirmed live 2026-09-26:
+          `ImportXml.parse()`'s own `default_tag_format` handling
+          creates a brand-new `Tag()` named from
+          `time.strftime(format)` and attaches it to *every* object in
+          the import, unconditionally, if this preference is on.
+          That Tag is added inside the reimport's own `batch=True`
+          DbTxn, which `transaction_commit()` never pushes while
+          `self._pulling` is set -- so it never reaches the server, and
+          the local "clear local mirror" step before the *next* resync
+          wipes it, so `ImportXml` mints a completely new one under a
+          fresh handle every single time. This is TODO.md gap 8's
+          confirmed root cause: no export-generation instability on
+          gramps-web-api's side at all (five separate live checks found
+          none), a purely local, per-installation artifact that also
+          explains why the very first push after such a bootstrap can
+          conflict with no other editor or edit involved -- the local
+          mirror and the server disagree on `tag_list` from the moment
+          bootstrap finishes. Neutralized via `set_feature(
+          "skip-import-additions", True)` -- the same existing,
+          purpose-built Gramps-core mechanism `gen/db/utils.py`'s
+          `import_as_dict()` already uses for an identical
+          "importing programmatically, not on the user's behalf"
+          reason (`ImportXml.importData()` itself checks this feature
+          before ever reading `tag-on-import` at all, so this is a
+          single flag away, not a config override). `_restabilize_tag_
+          handles()` is kept regardless as defense in depth against any
+          *other*, still-unidentified source of tag-handle churn -- see
+          its own docstring -- but this removes the one root cause this
+          investigation actually found and confirmed.
+
+        Deliberately does **not** touch `paths.ignore-xml-mediapath`
+        (a similarly-shaped local preference gating
+        `ImportXml.stop_mediapath()`, considered alongside "Tag on
+        import"): that setting doesn't exist at all on this addon's
+        actual target line, `maintenance/gramps60` (confirmed by
+        reading `gen/config.py` there directly) -- it's a
+        `gramps61`-or-later addition, and `config.get()`/`config.set()`
+        raise `AttributeError` for any unregistered name rather than
+        returning a default. An earlier version of this method touched
+        it based on reading newer core source without checking against
+        the actual target version first, and crashed `load()` outright
+        for every 6.0.x user (reported live 2026-09-26) -- worse than
+        the gap it was meant to close, since gramps60's own
+        `ImportXml.stop_mediapath()` has no local-preference gate to
+        neutralize in the first place there (it unconditionally does
+        `self.mediapath = tag`). See TODO.md gap 8's own update for the
+        full incident; the fix is to not touch a setting that isn't
+        there, not to guard the touch.
+
+        getattr(..., default)/get_feature()'s own None-safe default
+        guard each save/restore because unit tests construct a WebApiDB
+        directly (make_database() + load()) without going through
+        DbState, so these attributes/features may not exist yet -- real
+        usage always has the prefixes set by change_database_noclose()
+        before load() ever runs (the feature flag has no such
+        real-usage guarantee either way, hence the explicit default
+        here too).
+        """
+        saved_prefixes = {
+            attr: getattr(self, attr, default)
+            for attr, default in (
+                ("person_prefix", "I%04d"),
+                ("media_prefix", "O%04d"),
+                ("family_prefix", "F%04d"),
+                ("source_prefix", "S%04d"),
+                ("citation_prefix", "C%04d"),
+                ("place_prefix", "P%04d"),
+                ("event_prefix", "E%04d"),
+                ("repository_prefix", "R%04d"),
+                ("note_prefix", "N%04d"),
+            )
+        }
+
+        # get_feature()/set_feature() (DbReadBase) read/write
+        # self.__feature, initialized by DbReadBase.__init__() -- same
+        # unit-test gap as the prefixes above (WebApiDB.__new__() skips
+        # it entirely), but a method call raising AttributeError deep
+        # inside itself rather than a missing plain attribute, so it
+        # needs its own try/except rather than a getattr() default.
+        def _get_feature_or(default):
+            try:
+                return self.get_feature("skip-import-additions")
+            except AttributeError:
+                return default
+
+        def _set_feature_safely(value):
+            try:
+                self.set_feature("skip-import-additions", value)
+            except AttributeError:
+                pass
+
+        saved_skip_additions = _get_feature_or(None)
+        self.set_prefixes("I%d", "O%d", "F%d", "S%d", "C%d", "P%d", "E%d", "R%d", "N%d")
+        _set_feature_safely(True)
+        try:
+            importData(self, tmp_path, import_user)
+        finally:
+            self.set_prefixes(
+                saved_prefixes["person_prefix"],
+                saved_prefixes["media_prefix"],
+                saved_prefixes["family_prefix"],
+                saved_prefixes["source_prefix"],
+                saved_prefixes["citation_prefix"],
+                saved_prefixes["place_prefix"],
+                saved_prefixes["event_prefix"],
+                saved_prefixes["repository_prefix"],
+                saved_prefixes["note_prefix"],
+            )
+            _set_feature_safely(saved_skip_additions)
+
+    def _resync_after_conflict_async(self, on_done, on_error):
+        """Rebuild the local mirror from a fresh server export
+        (_full_resync_async()) before a conflict retry -- called by
+        _push_payload_async()'s WebApiPushConflict handler in place of
+        an incremental sync. Neither the incremental history feed nor a
+        totals check is trustworthy here: gramps-web-api's bulk-import
+        path (POST /importers/<ext>/file -- GEDCOM, Gramps XML, CSV,
+        ...) runs the same batch=True import machinery a local Gramps
+        client's own Import menu action would, which never touches the
+        transaction-history table at all (see the module docstring), so
+        the incremental feed can be blind to an object's true current
+        state indefinitely -- ordinary server administration for any
+        real installation, not a quirk of one server. A totals
+        comparison doesn't catch this either: the object count doesn't
+        change when an already-known object's content changes
+        server-side, only when objects are added or removed, so a
+        conflict caused by a content edit on a bulk-imported object
+        leaves totals matching on both sides even though the mirror's
+        copy of that object is stale.
+
+        A per-object REST fetch (GET /<type>/<handle>) was tried here
+        first and doesn't work: gramps-web-api's single-object endpoints
+        serialize with GrampsJSONEncoder.extract_object() (a walk of the
+        object's own __dict__/properties for the frontend's display
+        schema -- no "_class" tag on GrampsType-derived fields), not the
+        gramps.gen.lib.json_utils shape data_to_object() requires to
+        reconstruct a Gramps object. Only two things produce that
+        compatible shape: the transaction-history feed's new_data, and a
+        raw Gramps XML export -- see _full_resync_async()'s own
+        docstring. So a full resync, expensive as it is, is the only
+        server round-trip that can bring the local mirror back into a
+        state _retry_after_conflict() can safely build an "old" snapshot
+        from.
+
+        Caller already owns self._syncing (see _start_push()); this is a
+        thin, purpose-named wrapper around _full_resync_async() rather
+        than a second flag-managing layer -- unlike the old synchronous
+        _resync_after_conflict() this replaces, which had to manage
+        self._syncing itself since nothing else did for a plain push.
+        """
+        self._full_resync_async(on_done, on_error)
+
+    def _full_resync_async(self, on_done, on_error, progress_callback=None):
+        """Rebuild the local mirror from scratch: download the server's
+        own current Gramps XML export and reimport it, after clearing
+        every local primary object first. Called by
+        _resync_after_conflict_async() (a push conflict) and, from phase
+        4 on, also when the transaction-history feed contains an
+        empty-changes marker -- by definition there is nothing in that
+        history to replay for whatever produced it, so the only way to
+        recover is to fetch the server's current state wholesale, the
+        same way populating a brand new local mirror already works.
+
+        Deliberately reuses the stock ImportXml importer against a raw
+        XML export rather than reconstructing objects from the REST
+        /people/, /families/, ... endpoints: those return a marshalled
+        display schema (plain ints for GrampsType fields, no "_class"
+        tag), not the json_utils shape data_to_object() needs. Only the
+        transaction-history feed's new_data and a raw XML export share
+        that shape, and the whole point of this method is that the
+        former can't be trusted here.
+
+        Two steps: the download runs on io_runner (network + disk, no
+        self.dbapi touch); the clear-then-reimport runs as a single
+        runner (main-thread) step -- both the explicit clearing DbTxn
+        and ImportXml's own internal batch DbTxn, under self._pulling so
+        transaction_commit() treats them as pull-side replays rather
+        than local bulk edits to reconstruct and push back. Doing both
+        halves inside one callback body (rather than pumping between
+        them, as the old synchronous _full_resync() this will eventually
+        replace still does) means close() can no longer interrupt a
+        rebuild mid-way -- it can only run strictly before this step
+        starts or strictly after it returns.
+
+        rebuild() re-checks self._run_id itself, rather than relying
+        solely on self._guarded() around its scheduling, for a reason
+        specific to this method: the downloaded export is a real
+        resource (a temp file) that needs cleaning up even if the tree
+        closes in the gap between the download finishing and this step
+        actually running -- a self._guarded()-dropped callback runs
+        nothing at all, which would leak the file. Checking inside
+        rebuild() itself (before it does anything else) additionally
+        closes the narrower window between that check and the step
+        being scheduled, so self.dbapi -- possibly already closed by
+        then -- is never touched once the chain is known to be stale.
+
+        progress_callback, if given, gets a 0 marker before the download,
+        then real percentages throughout the reimport -- forwarded to
+        importData() via _import_progress_user(), which builds exactly
+        the gui.user.User Gramps' own GUI import uses (see that
+        function's docstring) -- and a final 100 once everything,
+        including request_rebuild(), has finished.
+
+        Also (re)sets sync_last_id to the server's own newest transaction
+        id as of right before the export download starts (see
+        _fetch_newest_transaction_id()), so the next incremental sync
+        asks the history feed for changes after that point instead of
+        wherever the walk that triggered this rebuild happened to leave
+        the cursor -- for the totals-shortfall case, that walk can be a
+        single empty page, which leaves sync_last_id at its untouched
+        starting value (0 for a brand new mirror) rather than anywhere
+        near "current". Left uncorrected, every later poll asks for
+        history "after id 0" forever on a server whose history can't
+        describe its own data anyway, so it's a harmless no-op -- but a
+        *push conflict*'s own recovery (resync then retry) uses that
+        exact same stuck cursor, so the resync it does can never
+        actually pick up what changed and the retry is doomed to repeat
+        the same conflict and give up. Fetched before the download
+        rather than after: a transaction the server commits while the
+        export is being generated or transferred is safer to see again
+        on the next poll (re-applying an already-reflected change is a
+        no-op) than to have it fall silently before the cursor and only
+        be discovered next time a shortfall check runs.
+        """
+        if progress_callback is not None:
+            progress_callback(0)
+        started = monotonic()
+        # Captured once, up front, and reused for every hop below --
+        # deliberately not re-wrapped via self._guarded() partway through
+        # (see on_downloaded()'s own comment for why that would be wrong
+        # here specifically).
+        run_id = self._run_id
+        guarded_done = self._guarded(lambda _: on_done(None))
+        guarded_error = self._guarded(on_error)
+
+        def download():
+            # io_runner: network + disk only -- the single longest
+            # transfer this addon makes. No on_chunk to pump for anymore
+            # (a worker thread has nothing to hand back to); one plain
+            # read is fine. The newest-transaction-id lookup goes first,
+            # per this method's own docstring on why "before the
+            # download" matters.
+            sync_cursor = self._fetch_newest_transaction_id()
+            data = self.web_client.download_export()
+            LOG.debug(
+                "resync: downloaded a %.1f MB export in %.2fs",
+                len(data) / (1024 * 1024),
+                monotonic() - started,
+            )
+            with NamedTemporaryFile(suffix=".gramps", delete=False) as tmp_file:
+                tmp_file.write(data)
+                return tmp_file.name, sync_cursor
+
+        def rebuild(tmp_path, sync_cursor):
+            # runner: clear + reimport + rebuild-signal + sync_last_id,
+            # all in one main-thread callback body -- see this method's
+            # own docstring on why that's the point, not incidental.
+            if self._run_id != run_id:
+                # The tree closed somewhere between the download
+                # finishing and this step actually running. Clean up the
+                # temp file -- nothing else will -- but do not touch
+                # self.dbapi, which may already be closed. See this
+                # method's own docstring on why this check lives here
+                # rather than relying on self._guarded() alone.
+                LOG.debug("resync: tree closed before rebuild ran; discarding it")
+                os.remove(tmp_path)
+                return
+            self._pulling = True
+            try:
+                before = self._snapshot_all_objects()
+                birth_death_snapshot = _snapshot_birth_death_indices(self)
+                tag_snapshot = _snapshot_tag_handles_by_name(self)
+                researcher_snapshot = _snapshot_researcher(self)
+                name_formats_snapshot = _snapshot_name_formats(self)
+                cleared = 0
+                with DbTxn(
+                    _("Clear local mirror before full resync"), self, batch=True
+                ) as trans:
+                    for key in set(CLASS_TO_KEY_MAP.values()):
+                        name = KEY_TO_NAME_MAP[key]
+                        handles = list(getattr(self, f"get_{name}_handles")())
+                        remove = getattr(self, f"remove_{name}")
+                        for handle in handles:
+                            remove(handle, trans)
+                        cleared += len(handles)
+                LOG.debug("resync: cleared %d local object(s); reimporting", cleared)
+                imported_at = monotonic()
+                import_user = (
+                    _import_progress_user(progress_callback)
+                    if progress_callback is not None
+                    else User()
+                )
+                self._reimport_neutralizing_local_settings(tmp_path, import_user)
+                LOG.debug(
+                    "resync: reimport left %d object(s) (%.2fs)",
+                    self.get_total(),
+                    monotonic() - imported_at,
+                )
+                with DbTxn(
+                    _("Normalize Unicode text form lost on reimport"),
+                    self,
+                    batch=True,
+                ) as trans:
+                    normalized = _normalize_reimported_text(self, trans)
+                if normalized:
+                    LOG.debug(
+                        "resync: normalized Unicode text form on %d "
+                        "object(s) Gramps XML re-import doesn't preserve "
+                        "consistently",
+                        normalized,
+                    )
+                if birth_death_snapshot:
+                    with DbTxn(
+                        _("Restore birth/death event references lost on reimport"),
+                        self,
+                        batch=True,
+                    ) as trans:
+                        restored = _restore_birth_death_indices(
+                            self, birth_death_snapshot, trans
+                        )
+                    if restored:
+                        LOG.debug(
+                            "resync: restored birth/death event reference "
+                            "index on %d person(s) Gramps XML re-import "
+                            "can't preserve",
+                            restored,
+                        )
+                if tag_snapshot:
+                    with DbTxn(
+                        _("Restabilize tag handles churned by reimport"),
+                        self,
+                        batch=True,
+                    ) as trans:
+                        restabilized = _restabilize_tag_handles(
+                            self, tag_snapshot, trans
+                        )
+                    if restabilized:
+                        LOG.debug(
+                            "resync: restabilized %d tag handle(s) gramps-web-"
+                            "api's own export doesn't keep stable across "
+                            "separate exports",
+                            restabilized,
+                        )
+                if _restore_researcher_if_locally_set(self, researcher_snapshot):
+                    LOG.debug(
+                        "resync: restored this mirror's own Researcher info "
+                        "ImportXml overwrote with the export's own"
+                    )
+                deduped = _deduplicate_name_formats(self, name_formats_snapshot)
+                if deduped:
+                    LOG.debug(
+                        "resync: removed %d duplicate name-format entry/"
+                        "entries ImportXml re-added",
+                        deduped,
+                    )
+                self._describe_resync_to_views(before)
+            finally:
+                self._pulling = False
+                os.remove(tmp_path)
+            self._set_metadata("sync_last_id", sync_cursor)
+            if progress_callback is not None:
+                progress_callback(100)
+
+        def on_downloaded(result):
+            # Deliberately NOT wrapped in self._guarded(): tmp_path is a
+            # real resource (a downloaded temp file) that needs cleaning
+            # up even if the tree closed while the download was in
+            # flight, and a self._guarded()-dropped callback runs
+            # nothing at all. rebuild() re-checks self._run_id itself
+            # (see its own comment) before touching self.dbapi, so
+            # scheduling it unconditionally here is still safe -- and
+            # guarded_done/guarded_error (captured once, above, against
+            # this call's original run_id) are reused rather than
+            # wrapped fresh here, since a fresh self._guarded() call made
+            # from inside this always-firing callback would capture
+            # self._run_id as it is *now* (already stale, in the case
+            # this comment is about), defeating the check entirely.
+            tmp_path, sync_cursor = result
+            self.runner.run(
+                lambda: rebuild(tmp_path, sync_cursor), guarded_done, guarded_error
+            )
+
+        self.io_runner.run(download, on_downloaded, guarded_error)
+
+    def _bootstrap_full_resync(self, progress_callback=None):
+        """load()'s own alternative to _full_resync_async(), used
+        specifically for the totals-shortfall check load() runs itself
+        before the ordinary record-sync call (see load()'s own comment)
+        -- most commonly hit opening a brand new mirror against a large
+        existing tree, exactly the scenario that prompted this method.
+
+        _full_resync_async() schedules its reimport step via
+        self.runner.run() (GLib.idle_add underneath), dispatched from
+        inside _run_async_to_completion()'s own pump loop
+        (_pump_main_loop(), using GLib.MainContext.iteration()) when
+        called from load(). importData()'s own progress reporting (see
+        _import_progress_user()) then calls Gtk.main_iteration() --
+        a *different* pumping API -- from inside that already-running
+        step. Gramps' own native GUI Import never has that outer
+        wrapping at all: it calls importData() directly from an ordinary
+        GTK signal handler. This method reproduces that same shape for
+        load()'s bootstrap case instead: plain sequential calls, on the
+        calling thread, with importData() itself never scheduled via
+        io_runner/runner/GLib.idle_add at all -- so there is nothing of
+        this addon's own left for importData()'s own pumping to end up
+        nested inside.
+
+        Confirmed via live GUI testing (2026-08-17) that this resolves a
+        freeze reported for exactly this load()-time scenario -- delete
+        an existing mirror, create a fresh one, open it against a large
+        (26540-object) tree. That investigation also uncovered an
+        unrelated, session-long confound (a stale/misresolved installed
+        plugin copy, see project memory) that had made every earlier
+        live test that session meaningless, regardless of what the code
+        actually did -- worth keeping in mind before reading too much
+        into the reentrant-pumping theory above as *proven*: it is
+        plausible and this method is a reasonable defensive structural
+        match to Gramps' own working native-Import shape, but the
+        specific freeze reports blamed on it before the stale-plugin
+        discovery are not reliable evidence either way. _full_resync_async()
+        itself is unchanged and still used for both its other callers
+        (_resync_after_conflict_async(), and _finish_sync()'s own
+        empty-"changes"-marker trigger) -- neither has actually been
+        shown to freeze; this method exists for the highest-traffic case
+        (a brand new or far-behind mirror at load() time) rather than as
+        a proven-required fix for the other two.
+
+        Safe to skip _full_resync_async()'s _run_id staleness checks and
+        self._guarded() wrapping here specifically because load() calls
+        this before the tree is open at all (dbloader.py's read_file()
+        doesn't call dbstate.change_database(db) until load() returns),
+        so there is no UI path by which close() could run against this
+        tree while this method is still executing -- unlike
+        _full_resync_async()'s other callers, which run against an
+        already-open tree where that's a live concern.
+
+        Body is otherwise a direct copy of _full_resync_async()'s
+        rebuild() (see that method for the fuller explanation of each
+        step): download, clear every local primary object, reimport,
+        signal a rebuild, and advance sync_last_id.
+
+        The download itself IS still run on io_runner and awaited via
+        _run_async_to_completion(), unlike everything after it -- unlike
+        importData(), nothing reentrant happens while it's in flight, so
+        there is no second pumping API for _run_async_to_completion()'s
+        own loop to end up nested under. Confirmed live (2026-08-17) that
+        running the download as a plain blocking call here instead --
+        unlike every other network call in this file -- froze the window
+        for its whole duration (6+ seconds for this export, longer for a
+        bigger one).
+
+        progress_callback, if given, is called throughout -- not just the
+        0/100 bookend load()'s other callers get. load() itself has
+        already reported 5/10/15/20 by the time this method is called
+        (see its own comments); from here, DOWNLOAD_START_PCT..
+        DOWNLOAD_END_PCT is a slow, fixed-rate pulse for the download
+        (there is no real byte-level progress to report for a single
+        unchunked read -- see the download() closure below -- so this is
+        proof of life, not a measurement), and
+        REIMPORT_START_PCT..100 is importData()'s own real percentage
+        (via _import_progress_user()), rescaled onto that remaining span
+        so the bar keeps climbing instead of resetting to 0% once the
+        reimport itself starts reporting.
+        """
+        DOWNLOAD_START_PCT = 20
+        DOWNLOAD_END_PCT = 30
+        REIMPORT_START_PCT = 30
+
+        started = monotonic()
+
+        def download():
+            # The newest-transaction-id lookup goes first, per
+            # _full_resync_async()'s own docstring on why "before the
+            # download" matters for this cursor.
+            sync_cursor = self._fetch_newest_transaction_id()
+            data = self.web_client.download_export()
+            # Bootstrap has no prior local mirror to carry a correct
+            # birth_ref_index/death_ref_index forward from (see
+            # _apply_true_birth_death_indices()'s docstring) -- fetch the
+            # server's ground truth instead, on this same io_runner
+            # network call alongside the export itself.
+            true_birth_death_indices = self.web_client.get_person_birth_death_indices()
+            return data, sync_cursor, true_birth_death_indices
+
+        # Ticks once a second, capped at DOWNLOAD_END_PCT, for as long as
+        # the download is in flight -- fires because
+        # _run_async_to_completion()'s own wait loop below pumps this
+        # same GLib main context. Cancelled in the finally below the
+        # instant the download finishes (success, failure, or a closed
+        # tree alike), so it never fires during the reimport phase, which
+        # reports its own real percentages instead.
+        pulse_source_id = None
+        if progress_callback is not None:
+            pulse_state = {"value": DOWNLOAD_START_PCT}
+
+            def pulse():
+                pulse_state["value"] = min(pulse_state["value"] + 1, DOWNLOAD_END_PCT)
+                progress_callback(pulse_state["value"])
+                return GLib.SOURCE_CONTINUE
+
+            pulse_source_id = GLib.timeout_add_seconds(1, pulse)
+
+        try:
+            result = self._run_async_to_completion(
+                lambda on_done, on_error: self.io_runner.run(
+                    download, self._guarded(on_done), self._guarded(on_error)
+                )
+            )
+        finally:
+            if pulse_source_id is not None:
+                GLib.source_remove(pulse_source_id)
+        if result is None:
+            # Tree closed while the download was in flight -- see
+            # _run_async_to_completion()'s own docstring. Not expected in
+            # practice for load()'s bootstrap case (see this method's own
+            # docstring on why), but handled the same way the rest of
+            # this file does rather than assumed away.
+            LOG.debug("bootstrap resync: tree closed during download; aborting")
+            return
+        data, sync_cursor, true_birth_death_indices = result
+        LOG.debug(
+            "bootstrap resync: downloaded a %.1f MB export in %.2fs",
+            len(data) / (1024 * 1024),
+            monotonic() - started,
+        )
+        with NamedTemporaryFile(suffix=".gramps", delete=False) as tmp_file:
+            tmp_file.write(data)
+            tmp_path = tmp_file.name
+        self._pulling = True
+        try:
+            before = self._snapshot_all_objects()
+            tag_snapshot = _snapshot_tag_handles_by_name(self)
+            researcher_snapshot = _snapshot_researcher(self)
+            name_formats_snapshot = _snapshot_name_formats(self)
+            cleared = 0
+            with DbTxn(
+                _("Clear local mirror before full resync"), self, batch=True
+            ) as trans:
+                for key in set(CLASS_TO_KEY_MAP.values()):
+                    name = KEY_TO_NAME_MAP[key]
+                    handles = list(getattr(self, f"get_{name}_handles")())
+                    remove = getattr(self, f"remove_{name}")
+                    for handle in handles:
+                        remove(handle, trans)
+                    cleared += len(handles)
+            LOG.debug(
+                "bootstrap resync: cleared %d local object(s); reimporting", cleared
+            )
+            imported_at = monotonic()
+            if progress_callback is not None:
+
+                def rescaled_progress(value):
+                    progress_callback(
+                        REIMPORT_START_PCT
+                        + int(value * (100 - REIMPORT_START_PCT) / 100)
+                    )
+
+                import_user = _import_progress_user(rescaled_progress)
+            else:
+                import_user = User()
+            self._reimport_neutralizing_local_settings(tmp_path, import_user)
+            LOG.debug(
+                "bootstrap resync: reimport left %d object(s) (%.2fs)",
+                self.get_total(),
+                monotonic() - imported_at,
+            )
+            with DbTxn(
+                _("Normalize Unicode text form lost on reimport"),
+                self,
+                batch=True,
+            ) as trans:
+                normalized = _normalize_reimported_text(self, trans)
+            if normalized:
+                LOG.debug(
+                    "bootstrap resync: normalized Unicode text form on %d "
+                    "object(s) Gramps XML re-import doesn't preserve "
+                    "consistently",
+                    normalized,
+                )
+            if true_birth_death_indices:
+                with DbTxn(
+                    _("Correct birth/death event references against the "
+                      "server"),
+                    self,
+                    batch=True,
+                ) as trans:
+                    corrected = _apply_true_birth_death_indices(
+                        self, true_birth_death_indices, trans
+                    )
+                if corrected:
+                    LOG.debug(
+                        "bootstrap resync: corrected birth/death event "
+                        "reference index on %d person(s) against the "
+                        "server's ground truth (Gramps XML re-import "
+                        "can't preserve either field at all)",
+                        corrected,
+                    )
+            if tag_snapshot:
+                with DbTxn(
+                    _("Restabilize tag handles churned by reimport"),
+                    self,
+                    batch=True,
+                ) as trans:
+                    restabilized = _restabilize_tag_handles(self, tag_snapshot, trans)
+                if restabilized:
+                    LOG.debug(
+                        "bootstrap resync: restabilized %d tag handle(s) "
+                        "gramps-web-api's own export doesn't keep stable "
+                        "across separate exports",
+                        restabilized,
+                    )
+            if _restore_researcher_if_locally_set(self, researcher_snapshot):
+                LOG.debug(
+                    "bootstrap resync: restored this mirror's own Researcher "
+                    "info ImportXml overwrote with the export's own"
+                )
+            deduped = _deduplicate_name_formats(self, name_formats_snapshot)
+            if deduped:
+                LOG.debug(
+                    "bootstrap resync: removed %d duplicate name-format "
+                    "entry/entries ImportXml re-added",
+                    deduped,
+                )
+            self._describe_resync_to_views(before)
+        finally:
+            self._pulling = False
+            os.remove(tmp_path)
+        self._set_metadata("sync_last_id", sync_cursor)
+        if progress_callback is not None:
+            progress_callback(100)
+
+    def _snapshot_all_objects(self):
+        """{(obj_class, handle): data} across every primary object the
+        local mirror holds right now, ``data`` being the same
+        json_utils-shaped, "_object"-stripped form transaction_to_json()
+        sends as "old"/"new" (_iter_raw_data() reads it straight back out
+        of storage via the same serializer _commit_base() wrote it with
+        -- see dbapi.py). Two callers, both diffing a before/after pair
+        via _diff_snapshots(): _reconcile_batch_commit() around a local
+        batch=True transaction (transaction_begin()'s own call is the
+        "before" half), and _full_resync_async()/_bootstrap_full_resync()
+        around a full wipe-and-reimport (see _describe_resync_to_views()).
+
+        Uses _iter_raw_data() (one bulk SELECT per object type) rather
+        than _get_raw_data() per handle, so this is O(types) queries,
+        not O(handles) -- cheap regardless of how many objects a batch
+        operation actually touches.
+        """
+        snapshot = {}
+        for obj_class, key in CLASS_TO_KEY_MAP.items():
+            for handle, data in self._iter_raw_data(key):
+                snapshot[(obj_class, handle)] = remove_object(data)
+        return snapshot
+
+    def _describe_resync_to_views(self, before):
+        """Tell every already-open view what a full resync's clear+
+        reimport actually changed -- called by _full_resync_async()'s
+        rebuild() and _bootstrap_full_resync(), once each has finished
+        reimporting (and, for the former, restoring whatever
+        _restore_birth_death_indices() could).
+
+        request_rebuild() (DbGeneric's own "too much changed to describe
+        incrementally" signal, gen/db/generic.py) is correct for the
+        genuinely-everything-changed case -- a brand new mirror, or one
+        so far behind a repair effectively rebuilds it -- but it is
+        needlessly disruptive for the far more common case this resync
+        recovers from: a push conflict or a mirror-repair shortfall,
+        where the mirror was already correct for everything except the
+        handful of objects actually involved and the wipe+reimport was
+        only ever a (surprisingly expensive) way to get back to that
+        state. gramps.gui.displaystate.py's own History.history_changed()
+        listens for exactly this signal and responds by resetting Active
+        Person to find_initial_person() unconditionally -- confirmed live
+        (2026-08-17): a user mid-edit on one Person, with a different
+        Person active, would see Active Person silently reset out from
+        under them on every conflict-triggered resync, since a plain
+        commit conflict already means at least one resync ran before the
+        edit could even be retried.
+
+        _diff_snapshots() (the same before/after diff
+        _reconcile_batch_commit() uses to reconstruct a local batch
+        commit, minus the push -- what was just pulled *from* the server
+        must never be pushed back) turns ``before`` and a fresh
+        _snapshot_all_objects() into the same shape _emit_change_signals()
+        already knows how to turn into precise person-add/family-update/
+        event-delete/... signals. A view listening for those (rather than
+        a blanket rebuild) only reloads what actually changed -- and
+        History only resets Active Person if the active object's own
+        handle is among them.
+
+        GRANULAR_REBUILD_MAX_CHANGES caps this: above it, the diff itself
+        is legitimately "everything" (an empty-mirror bootstrap, or a
+        repair recovering from a mirror badly out of step), where one
+        rebuild signal per type is cheaper for every view than replaying
+        that many individual signals -- so request_rebuild() stays the
+        right tool there. An empty diff (nothing genuinely changed --
+        possible for a mirror-repair triggered by a totals check that
+        turns out to have been spurious) skips telling views anything at
+        all, rather than either signal shape.
+        """
+        entries = _diff_snapshots(before, self._snapshot_all_objects())
+        if not entries:
+            return
+        if len(entries) > GRANULAR_REBUILD_MAX_CHANGES:
+            self.request_rebuild()
+            return
+        net_changes = {
+            (entry["_class"], entry["handle"]): _NAME_TO_TRANS_TYPE[entry["type"]]
+            for entry in entries
+        }
+        self._emit_change_signals(net_changes)
+
+    def _reconcile_batch_commit(self, before, message=None):
+        """Reconstruct exactly what a local batch=True transaction
+        changed, by diffing the pre-transaction object snapshot
+        (transaction_begin()'s _snapshot_all_objects() call) against a
+        fresh one taken now (via _diff_snapshots()), and push the result
+        -- see the module docstring's note on why a batch commit is
+        otherwise invisible to transaction_to_json().
+
+        Getting "old" right this way -- genuinely the pre-transaction
+        state, not whatever commit_<type>()/remove_<type>() happens to
+        find in local storage if replayed afterward -- is the point.
+        local storage by reconciliation time already holds the batch's
+        own result, not what the mirror last actually synced with the
+        server; replaying against it (an earlier version of this method
+        did, via _retry_after_conflict()) sends a false "old" a real
+        server always rejects as a conflict for an add, and a no-op
+        "old"-matches-"new" for an update -- and for a delete, replaying
+        against already-gone-for-real local storage does nothing at
+        all, silently dropping it. Building the payload directly here
+        instead avoids all three: pushed the same way as any other
+        local edit (transaction_commit() -> _push_payload()), with that
+        method's existing conflict handling (full resync then
+        _retry_after_conflict()) intact for the rare case something
+        else changed the same object in the meantime.
+
+        Cost: a full before/after object snapshot, not just handle sets
+        or timestamps -- see _snapshot_all_objects()'s own docstring for
+        why, and why that stays cheap (O(types) queries) regardless. If
+        this ever shows up as a real bottleneck, the fix is to make the
+        batch operation's own transaction non-batch, not to make this
+        cleverer.
+
+        ``message`` (see push_transaction()'s docstring) is the
+        triggering batch DbTxn's own description, forwarded through to
+        _start_push() -- the reconstructed entries otherwise carry no
+        description of their own.
+        """
+        entries = _diff_snapshots(before, self._snapshot_all_objects())
+        if not entries:
+            return
+        LOG.info(
+            "Reconstructed %d change(s) from a local batch transaction that "
+            "Gramps did not record per-object; pushing them to the server.",
+            len(entries),
+        )
+        self._start_push(entries, message=message)
+
+    def _sync_from_server_async(
+        self, on_done, on_error, progress_callback=None, verify_totals=False
+    ):
+        """
+        Pull every transaction with an id after the last-seen one and
+        replay its changes into the local mirror. Calls on_done(applied)
+        with the number of changes applied.
+
+        An empty "changes" list on a transaction is not a no-op: it is
+        what a batch=True commit leaves behind (see the module
+        docstring's note on trans.batch guards around trans.add()) --
+        something happened server-side that this feed cannot describe.
+        Flagged rather than silently skipped; _full_resync_async() is
+        the fallback once the whole page range has been walked (so the
+        sync cursor still advances past it and any *describable*
+        changes around it are applied normally either way). A feed that
+        is empty *altogether*, or too sparse to account for what the
+        server holds, is the same kind of gap and gets the same
+        fallback -- see _mirror_is_short_of_the_server_async(), which
+        ``verify_totals`` asks for (load() always does; the poll does
+        too, but only once every VERIFY_TOTALS_POLL_INTERVAL_SECONDS).
+
+        progress_callback, if given, is called with an int 0-100 after
+        each page -- see load()'s callback param. "total" comes from the
+        server's X-Total-Count for this "after_id" filter (get_transaction_
+        history()'s docstring), so it stays a stable denominator across
+        pages barring concurrent server-side writes during the sync.
+
+        Caller already owns self._syncing (see _start_push()'s
+        docstring for why none of this file's ..._async() chains touch
+        that flag themselves). Alternates io_runner (fetch one page) and
+        runner (apply that page's batch DbTxn replay) for as many pages
+        as the feed has -- a recursive continuation (_sync_page())
+        rather than a fixed-length chain, since the page count isn't
+        known up front.
+        """
+        started = monotonic()
+
+        def begin_sync(after_id):
+            LOG.debug("sync: asking for transactions after id %s", after_id)
+            self._sync_page(
+                after_id=after_id,
+                cursor=after_id,
+                page=1,
+                seen=0,
+                applied=0,
+                skipped=0,
+                needs_full_resync=False,
+                started=started,
+                progress_callback=progress_callback,
+                verify_totals=verify_totals,
+                on_done=on_done,
+                on_error=on_error,
+            )
+
+        def after_flush(_result):
+            after_id = self._get_metadata("sync_last_id", default=None)
+            if after_id is not None:
+                begin_sync(after_id)
+                return
+            # No id-cursor persisted yet -- either a brand new mirror
+            # (nothing to migrate, start at 0, same as always) or one
+            # whose cursor still predates the after_id switch (see
+            # get_transaction_history()'s own docstring on why that
+            # switch happened) and needs its one-time upgrade. old_after
+            # is read here, on the main thread, because self.dbapi --
+            # what self._get_metadata() touches -- is main-thread-only;
+            # _migrate_sync_cursor_to_id() itself runs on io_runner and
+            # must not touch it.
+            old_after = self._get_metadata("sync_last_time", default=None)
+            if old_after is None:
+                self._set_metadata("sync_last_id", 0)
+                begin_sync(0)
+                return
+
+            def migrate():
+                # io_runner: network only.
+                return self._migrate_sync_cursor_to_id(old_after)
+
+            def on_migrated(new_after_id):
+                self._set_metadata("sync_last_id", new_after_id)
+                begin_sync(new_after_id)
+
+            self.io_runner.run(
+                migrate, self._guarded(on_migrated), self._guarded(on_error)
+            )
+
+        self._flush_pending_pushes_async(after_flush, on_error)
+
+    def _fetch_newest_transaction_id(self):
+        """io_runner: the server's own current highest transaction id, or
+        0 if its history is empty. Pure network -- safe to call from
+        io_runner. Shared by _migrate_sync_cursor_to_id() (a mirror's
+        one-time cursor upgrade) and _full_resync_async()/
+        _bootstrap_full_resync() (marking "everything as of this
+        wholesale export is already reflected locally" -- see either
+        method's own docstring on why it needs this rather than a
+        wall-clock timestamp)."""
+        newest, _total = self.web_client.get_transaction_history(
+            after_id=0, page=1, pagesize=1, sort="-id"
+        )
+        return newest[0]["id"] if newest else 0
+
+    def _migrate_sync_cursor_to_id(self, old_after):
+        """io_runner: the network half of the one-time upgrade from the
+        old timestamp-based sync cursor (sync_last_time) to the exact
+        transaction-id cursor (sync_last_id) -- see get_transaction_
+        history()'s own docstring on why this addon switched, and
+        _sync_from_server_async()'s after_flush() for the main-thread
+        bookkeeping around this call.
+
+        Asks the server, with the *old* timestamp cursor, for the
+        single oldest transaction after it (sort=id ascending,
+        pagesize=1) and starts the new cursor one below that
+        transaction's own id -- so the very next id-cursored fetch sees
+        that transaction again exactly once (a safe, idempotent replay
+        -- see _apply_change()) rather than risk the float round-trip
+        this migration exists to get away from having silently skipped
+        past it.
+
+        A mirror that was already fully caught up as of the old cursor
+        (nothing found after it) instead bootstraps from the server's
+        current newest transaction id (_fetch_newest_transaction_id()),
+        the same way gramps-connect's own pollHistory() seeds a fresh
+        session: there is nothing older to safely re-see, and starting
+        at 0 would mean replaying the server's entire history for a
+        mirror that didn't need any of it.
+        """
+        transactions, _total = self.web_client.get_transaction_history(
+            after=old_after, page=1, pagesize=1
+        )
+        if transactions:
+            return transactions[0]["id"] - 1
+        return self._fetch_newest_transaction_id()
+
+    def _sync_page(
+        self,
+        after_id,
+        cursor,
+        page,
+        seen,
+        applied,
+        skipped,
+        needs_full_resync,
+        started,
+        progress_callback,
+        verify_totals,
+        on_done,
+        on_error,
+    ):
+        """_sync_from_server_async()'s per-page step: fetches one page
+        on io_runner, applies it on runner, and recurses for the next
+        page until the feed runs dry or hands back a short page.
+
+        ``after_id`` is the *filter* sent to get_transaction_history()
+        on every page of this walk, and deliberately never changes
+        between recursive calls: gramps-web-api applies page/pagesize as
+        an offset into the already-after_id-filtered set (undodb.
+        get_transactions()), so advancing after_id at the same time as
+        page -- what this method used to do, back when the filter was
+        the timestamp-based ``after`` and got reassigned to the running
+        max seen each page -- silently skips a whole page's worth of
+        transactions every time pagination continues past the first
+        page. ``cursor`` is the separate, genuinely-advancing bookkeeping
+        value (the highest transaction id actually seen so far in this
+        walk) that _finish_sync() eventually persists as sync_last_id;
+        it plays no part in the query itself.
+        """
+        run_id = self._run_id
+
+        def fetch():
+            # io_runner: network only.
+            return self.web_client.get_transaction_history(
+                after_id=after_id, page=page, pagesize=SYNC_PAGE_SIZE
+            )
+
+        def on_fetched(result):
+            transactions, total = result
+            if not transactions:
+                self._finish_sync(
+                    cursor,
+                    seen,
+                    applied,
+                    skipped,
+                    needs_full_resync,
+                    started,
+                    progress_callback,
+                    verify_totals,
+                    on_done,
+                    on_error,
+                )
+                return
+
+            def apply_page():
+                # runner: self._pulling around a batch=True DbTxn
+                # replay, then signal emission -- identical body to the
+                # old synchronous per-page work, no pump in the middle.
+                # Re-checks self._run_id itself, like
+                # _full_resync_async()'s rebuild(): this step was
+                # scheduled from inside an already-guarded callback
+                # (on_fetched), and close() could in principle run in
+                # the gap between that scheduling and this actually
+                # executing -- see that method's own comment for the
+                # fuller explanation.
+                if self._run_id != run_id:
+                    LOG.debug(
+                        "sync: tree closed before this page was applied; "
+                        "discarding it"
+                    )
+                    return None
+                new_cursor = cursor
+                # (obj_class, handle) -> trans_type, collapsed to the
+                # net effect within this page -- see
+                # _emit_change_signals().
+                net_changes = {}
+                new_applied = applied
+                new_skipped = skipped
+                new_needs_full_resync = needs_full_resync
+                # _pulling marks this batch DbTxn as one of our own
+                # replays, so transaction_begin() doesn't snapshot
+                # handles for it and transaction_commit() doesn't try to
+                # push it back out as if it were a local bulk edit -- see
+                # the module docstring.
+                self._pulling = True
+                try:
+                    with DbTxn("Sync from server", self, batch=True) as trans:
+                        for server_trans in transactions:
+                            if not server_trans["changes"]:
+                                new_needs_full_resync = True
+                            for change in server_trans["changes"]:
+                                if self._apply_change(change, trans):
+                                    new_applied += 1
+                                    net_changes[
+                                        (change["obj_class"], change["obj_handle"])
+                                    ] = change["trans_type"]
+                                else:
+                                    # Reference-type changes and anything
+                                    # else with no primary-object class
+                                    # to map -- counted rather than
+                                    # logged per change, which would be
+                                    # one line per row of the feed.
+                                    new_skipped += 1
+                            new_cursor = max(new_cursor, server_trans["id"])
+                finally:
+                    self._pulling = False
+                self._emit_change_signals(net_changes)
+                return new_cursor, new_applied, new_skipped, new_needs_full_resync
+
+            def on_applied(result2):
+                if result2 is None:
+                    # Stale (see apply_page()'s own check) -- nothing to
+                    # continue with. self._guarded() below already drops
+                    # this same case for a tree closed *before*
+                    # apply_page() even started; this covers the
+                    # narrower gap where it closed after.
+                    return
+                (
+                    new_cursor,
+                    new_applied,
+                    new_skipped,
+                    new_needs_full_resync,
+                ) = result2
+                new_seen = seen + len(transactions)
+                LOG.debug(
+                    "sync: page %d, %d transaction(s) of %s, %d change(s) "
+                    "applied so far, cursor %s",
+                    page,
+                    len(transactions),
+                    total,
+                    new_applied,
+                    new_cursor,
+                )
+                if progress_callback is not None and total:
+                    progress_callback(min(100, int(new_seen * 100 / total)))
+                if len(transactions) < SYNC_PAGE_SIZE:
+                    self._finish_sync(
+                        new_cursor,
+                        new_seen,
+                        new_applied,
+                        new_skipped,
+                        new_needs_full_resync,
+                        started,
+                        progress_callback,
+                        verify_totals,
+                        on_done,
+                        on_error,
+                    )
+                else:
+                    self._sync_page(
+                        after_id=after_id,
+                        cursor=new_cursor,
+                        page=page + 1,
+                        seen=new_seen,
+                        applied=new_applied,
+                        skipped=new_skipped,
+                        needs_full_resync=new_needs_full_resync,
+                        started=started,
+                        progress_callback=progress_callback,
+                        verify_totals=verify_totals,
+                        on_done=on_done,
+                        on_error=on_error,
+                    )
+
+            self.runner.run(
+                apply_page, self._guarded(on_applied), self._guarded(on_error)
+            )
+
+        self.io_runner.run(fetch, self._guarded(on_fetched), self._guarded(on_error))
+
+    def _finish_sync(
+        self,
+        after_id,
+        seen,
+        applied,
+        skipped,
+        needs_full_resync,
+        started,
+        progress_callback,
+        verify_totals,
+        on_done,
+        on_error,
+    ):
+        """_sync_page()'s tail once the feed runs dry (immediately, or
+        after the last, short page): persist the cursor, log a summary,
+        fall back to a full resync if the feed couldn't describe
+        everything (or, if asked, the mirror's own object count says
+        it's short), and call on_done(applied). Always reached on the
+        main thread (either from on_fetched()'s own immediate branch or
+        from apply_page()'s on_applied(), a runner step's on_success),
+        so self._set_metadata() here is safe."""
+        self._set_metadata("sync_last_id", after_id)
+        LOG.debug(
+            "sync: %d change(s) applied, %d skipped, from %d transaction(s) "
+            "in %.2fs; cursor now %s",
+            applied,
+            skipped,
+            seen,
+            monotonic() - started,
+            after_id,
+        )
+
+        def maybe_full_resync(needs_resync):
+            if needs_resync:
+                # Deliver the record-sync's own applied count to on_done
+                # regardless of the resync outcome, matching what the
+                # old synchronous method always returned here -- a full
+                # resync's own result isn't what a caller of *this*
+                # method is asking about.
+                self._full_resync_async(
+                    lambda _: on_done(applied),
+                    on_error,
+                    progress_callback=progress_callback,
+                )
+            else:
+                on_done(applied)
+
+        if not needs_full_resync and verify_totals:
+            self._mirror_is_short_of_the_server_async(maybe_full_resync, on_error)
+        else:
+            maybe_full_resync(needs_full_resync)
+
+    def _mirror_is_short_of_the_server_async(self, on_done, on_error):
+        """Whether the mirror holds fewer objects than the server says
+        its tree has, once the incremental sync has had its turn -- the
+        other way the history feed can fail to describe the server's
+        state, alongside the empty-"changes" marker
+        _sync_from_server_async() already watches for. Calls
+        on_done(True) if the mirror is short and needs a full resync,
+        on_done(False) otherwise.
+
+        A server can hold a full tree that its history does not account
+        for: that table only records what gramps-web-api itself wrote, so
+        anything populated by another route (a server-side import straight
+        into the database, a restored dump, a truncated history table) has
+        nothing to replay. https://demo.grampsweb.org is exactly this --
+        4668 people, and GET /transactions/history/ returned X-Total-Count
+        0 until someone edited it through the API. Without this check,
+        syncing such a server is *silently* wrong: load() succeeds, the
+        feed describes only the handful of edits it does know about, and
+        the user gets a Family Tree holding those and nothing else, with
+        nothing in the log to say why.
+
+        Comparing totals rather than asking whether the feed came back
+        empty is what makes that case detectable at all. An empty feed is
+        only the extreme of it: one API edit against a history-less server
+        is enough to hand back a transaction, advance sync_last_id, and
+        make the sync look like it worked. Both counts cover the same ten
+        primary types (webapi_client.OBJECT_COUNT_KEYS mirrors Gramps'
+        own DbGeneric.get_total()), so equality is the invariant this
+        addon exists to maintain and a mirror that falls short of it is
+        provably missing data -- _full_resync_async()'s wholesale XML
+        export being the same recovery used for the empty-"changes" case,
+        and for the same reason: the history cannot describe what is
+        already there.
+
+        Only run where _sync_from_server_async()'s caller asks for it --
+        load() every time, and _poll_tick() once every
+        VERIFY_TOTALS_POLL_INTERVAL_SECONDS rather than every 10-second
+        tick (see that constant): the extra GET /metadata/ request is
+        cheap enough for that cadence, but not for every tick forever,
+        and a shortfall discovered mid-session still routes to the same
+        _full_resync_async() a shortfall at load() would -- no longer
+        only repaired when the tree happens to be reopened.
+
+        Skipped outright while pushes are queued (see
+        _queue_pending_push()): those are local edits the server has not
+        accepted yet, so the two counts are legitimately out of step, and
+        rebuilding from the server's export in that state would fight with
+        work still waiting to go the other way.
+
+        A *larger* local total isn't treated as damage: an extra local
+        object is either something this mirror is about to push or
+        something the export would silently destroy, neither of which a
+        rebuild should decide on its own. Only a shortfall is repaired.
+
+        The local total is a DB read (must run on runner); the server's
+        count is a network call (must run on io_runner) -- one extra hop
+        rather than reading self.dbapi from io_runner, consistent with
+        every other DB-read-then-network-call split in this file.
+        """
+        if self._get_metadata("pending_pushes", default=[]):
+            LOG.debug("Pending pushes queued; skipping the mirror total check.")
+            on_done(False)
+            return
+
+        def read_local_total():
+            return self.get_total()
+
+        def on_local_total(local_total):
+            def fetch_server_total():
+                return self.web_client.get_object_count()
+
+            def on_server_total(server_total):
+                LOG.debug(
+                    "totals: local mirror %d, server %d", local_total, server_total
+                )
+                if local_total >= server_total:
+                    on_done(False)
+                    return
+                LOG.warning(
+                    "Local mirror holds %d objects but the server reports "
+                    "%d; its transaction history cannot account for the "
+                    "difference, so the mirror is being rebuilt from a "
+                    "full export.",
+                    local_total,
+                    server_total,
+                )
+                on_done(True)
+
+            self.io_runner.run(
+                fetch_server_total,
+                self._guarded(on_server_total),
+                self._guarded(on_error),
+            )
+
+        self.runner.run(
+            read_local_total, self._guarded(on_local_total), self._guarded(on_error)
+        )
+
+    def _sync_media_files_async(self, on_done, on_error):
+        """
+        Download media files missing locally, then upload local media
+        files the server doesn't have yet -- the file-transfer half of
+        keeping the mirror in sync, alongside _sync_from_server()'s
+        object-record replay (which only ever moves a Media object's
+        *metadata* -- path, description, checksum, ... -- never the file
+        the path points at). See the module docstring's note on why this
+        runs on its own, coarser timer instead of every record-sync tick.
+
+        A single file failing to transfer (network error, a stale handle,
+        a 409 because something else uploaded it first) is logged and
+        skipped rather than aborting the rest of the pass -- the same
+        shape as _push_payload_async()'s error handling, just applied per
+        file here since there is no single all-or-nothing request
+        covering every file the way POST /transactions/ does for object
+        records.
+
+        Three steps, alternating io_runner (network) and runner (DB
+        reads) -- the old per-file loop interleaved a DB read with a
+        network call on every single file, which a worker thread must
+        never do (self.dbapi is only safe to touch from the main thread),
+        so this instead resolves every handle this pass will touch to a
+        (handle, path) pair up front, on the main thread, before any
+        network I/O starts:
+
+          1. io_runner: ask the server which files it's missing.
+          2. runner: resolve this pass's missing-local and missing-remote
+             media to (handle, path) pairs (_scan_and_resolve_media()) --
+             the last thing to touch self.dbapi.
+          3. io_runner: actually move the files (_transfer_media_files()),
+             pure network + local disk I/O.
+
+        Calls on_done((downloaded, uploaded)) when finished. Caller
+        already owns self._syncing (see the module docstring's note on
+        why _push_payload_async()'s ..._async() methods never touch it
+        themselves).
+        """
+        started = monotonic()
+
+        def fetch_remote_missing():
+            return self.web_client.get_missing_files()
+
+        def on_remote_missing_fetched(remote_missing):
+            def scan():
+                return self._scan_and_resolve_media(remote_missing)
+
+            def on_scanned(scan_result):
+                missing_local, missing_remote = scan_result
+
+                def transfer():
+                    return self._transfer_media_files(missing_local, missing_remote)
+
+                def on_transferred(transfer_result):
+                    downloaded, uploaded = transfer_result
+                    LOG.debug(
+                        "media: %d missing locally (%d downloaded), %d missing "
+                        "on the server (%d uploaded), in %.2fs",
+                        len(missing_local),
+                        downloaded,
+                        len(missing_remote),
+                        uploaded,
+                        monotonic() - started,
+                    )
+                    if downloaded or uploaded:
+                        LOG.info(
+                            "Media file sync: downloaded %d file(s), uploaded "
+                            "%d file(s).",
+                            downloaded,
+                            uploaded,
+                        )
+                    on_done((downloaded, uploaded))
+
+                self.io_runner.run(
+                    transfer, self._guarded(on_transferred), self._guarded(on_error)
+                )
+
+            self.runner.run(scan, self._guarded(on_scanned), self._guarded(on_error))
+
+        self.io_runner.run(
+            fetch_remote_missing,
+            self._guarded(on_remote_missing_fetched),
+            self._guarded(on_error),
+        )
+
+    def _scan_and_resolve_media(self, remote_missing):
+        """Resolve this pass's missing-local and missing-remote media to
+        ``(handle, path)`` pairs while still on the main thread -- DB
+        reads (iter_media(), get_media_from_handle()) plus a cheap
+        os.path.exists() check, no network. Ported from the old
+        _missing_local_media_handles()/_missing_remote_media_handles(),
+        fused with the local-object lookup the old per-file
+        _download_one_media_file()/_upload_one_media_file() each did
+        separately, so _transfer_media_files() below never needs to
+        touch self.dbapi again once this returns -- see
+        _sync_media_files_async()'s docstring for why that split exists.
+
+        ``remote_missing`` is the server's own answer (web_client.
+        get_missing_files()) to "which Media objects have no uploaded
+        file yet" -- a list of dicts with a "handle" key.
+        """
+        missing_local = []
+        for media in self.iter_media():
+            path = media_path_full(self, media.get_path())
+            if not os.path.exists(path):
+                missing_local.append((media.handle, path))
+
+        missing_remote = []
+        for item in remote_missing:
+            handle = item["handle"]
+            try:
+                obj = self.get_media_from_handle(handle)
+            except HandleError:
+                # The object was removed locally between the scan and here.
+                continue
+            path = media_path_full(self, obj.get_path())
+            if os.path.exists(path):
+                missing_remote.append((handle, path))
+        return missing_local, missing_remote
+
+    def _transfer_media_files(self, missing_local, missing_remote):
+        """Actually move the files: pure network + local disk I/O, no
+        self.dbapi touch at all -- every handle needed was already
+        resolved to a path by _scan_and_resolve_media() on the main
+        thread, so this is safe to run entirely on io_runner. A transfer
+        failing (network error, a 409 because something else uploaded it
+        first) is logged and skipped rather than aborting the rest of
+        the pass.
+
+        Logs by handle rather than gramps_id, unlike the old per-file
+        helpers this replaces: gramps_id would mean a get_media_from_
+        handle() call here, and this method must not touch self.dbapi.
+        """
+        downloaded = 0
+        for handle, path in missing_local:
+            try:
+                self.web_client.download_media_file(handle, path)
+            except _CONNECTION_ERRORS as err:
+                LOG.warning(
+                    "Failed to download media file for handle %s: %s", handle, err
+                )
+                continue
+            downloaded += 1
+
+        uploaded = 0
+        for handle, path in missing_remote:
+            try:
+                if self.web_client.upload_media_file(handle, path):
+                    uploaded += 1
+            except _CONNECTION_ERRORS as err:
+                LOG.warning(
+                    "Failed to upload media file for handle %s: %s", handle, err
+                )
+        return downloaded, uploaded
+
+    def _apply_change(self, change, trans):
+        """Replay one server change into the local mirror. Returns True
+        if it was a recognized primary-object change (as opposed to a
+        reference-type change, which carries no obj_class we can map)."""
+        obj_class = change["obj_class"]
+        key = CLASS_TO_KEY_MAP.get(obj_class)
+        if key is None:
+            return False
+        name = KEY_TO_NAME_MAP[key]
+        handle = change["obj_handle"]
+        if change["trans_type"] == TXNDEL:
+            getattr(self, f"remove_{name}")(handle, trans)
+        else:
+            # add and update are both upserts at the DBAPI level, so
+            # there's no need to treat them differently here.
+            obj = data_to_object(change["new_data"])
+            getattr(self, f"commit_{name}")(obj, trans)
+        return True
+
+    def _emit_change_signals(self, net_changes):
+        """Emit the person-add/family-update/event-delete/... signals a
+        normal (non-batch) local commit would have emitted for these same
+        changes -- see the module docstring's note on why
+        _sync_from_server()'s batch=True replay needs this done by hand.
+
+        net_changes: {(obj_class, obj_handle): trans_type}, already
+        collapsed to the net effect per handle (see _sync_from_server()).
+        Unrecognized obj_class values (reference-type changes never reach
+        here in the first place -- see _apply_change()) are skipped the
+        same way _apply_change() skips them.
+
+        Grouped and emitted in the same order DBAPI.transaction_commit()
+        uses for a normal commit -- deletes and adds before updates -- so
+        a view that (for instance) cares about total counts sees them
+        change before it sees an in-place update to one of the survivors.
+        """
+        by_type = {TXNDEL: {}, TXNADD: {}, TXNUPD: {}}
+        for (obj_class, handle), trans_type in net_changes.items():
+            key = CLASS_TO_KEY_MAP.get(obj_class)
+            if key is None:
+                continue
+            name = KEY_TO_NAME_MAP[key]
+            by_type[trans_type].setdefault(name, []).append(handle)
+        for trans_type in (TXNDEL, TXNADD, TXNUPD):
+            for name, handles in by_type[trans_type].items():
+                self.emit(name + _TRANS_TYPE_ACTION[trans_type], (handles,))

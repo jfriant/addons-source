@@ -27,6 +27,9 @@ import json
 import logging
 import os
 import platform
+import socket
+import ssl
+import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -42,6 +45,41 @@ from gramps.gen.db.dbconst import TXNADD, TXNDEL, TXNUPD
 
 LOG = logging.getLogger("grampswebsync")
 
+#: Seconds before a request that has produced nothing is abandoned. Without
+#: this, ``urlopen`` waits forever and an unreachable-but-listening server
+#: hangs the tool with no way out.
+TIMEOUT = 60
+
+
+class ServerTaskFailed(Exception):
+    """A background task on the server reported failure.
+
+    Carries the server's own description rather than a stringified status dict,
+    so the message shown to the user says what went wrong.
+    """
+
+
+def describe_task_failure(task_status: dict[str, Any]) -> str:
+    """Extract a readable reason from a failed task status.
+
+    The status dict carries the reason in one of a few shapes depending on how
+    the task died. Stringifying the whole dict, as this once did, produced a
+    message no user could act on.
+
+    :param task_status: The server's task status document.
+    :returns: The most specific description available.
+    """
+    info = task_status.get("info")
+    if isinstance(info, dict):
+        for key in ("message", "error", "detail"):
+            value = info.get(key)
+            if value:
+                return str(value)
+    elif info:
+        return str(info)
+    state = task_status.get("state", "FAILURE")
+    return f"The server reported task state {state}."
+
 
 def parse_version(version) -> tuple[int, int]:
     """Simple dependency-free version to parse a SemVer into a list of ints."""
@@ -55,25 +93,71 @@ def parse_version(version) -> tuple[int, int]:
     return (parts[0], parts[1])
 
 
-def create_macos_ssl_context():
-    import ssl
-    import subprocess
+#: Apple's public roots — absent from the ``security list-keychains`` list.
+MACOS_ROOT_KEYCHAIN = "/System/Library/Keychains/SystemRootCertificates.keychain"
 
-    """Creates an SSL context using macOS system certificates."""
+#: The machine-wide keychain, where an administrator installs a private CA.
+MACOS_ADMIN_KEYCHAIN = "/Library/Keychains/System.keychain"
+
+KEYCHAIN_TIMEOUT = 30
+
+
+def _macos_keychains() -> list[str]:
+    """Return the keychains to read trust anchors from, in search order."""
+    keychains = [MACOS_ROOT_KEYCHAIN, MACOS_ADMIN_KEYCHAIN]
+    try:
+        listed = subprocess.run(
+            ["security", "list-keychains"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=KEYCHAIN_TIMEOUT,
+        ).stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError) as exc:
+        LOG.warning("Could not list macOS keychains: %s", exc)
+        listed = ""
+    # Each entry is quoted and indented on its own line.
+    for line in listed.splitlines():
+        path = line.strip().strip('"')
+        if path and path not in keychains:
+            keychains.append(path)
+    return keychains
+
+
+def create_macos_ssl_context() -> ssl.SSLContext:
+    """Create an SSL context trusting the CAs in the user's macOS keychains.
+
+    Searches the hard-coded system keychains and the user keychains reported
+    by ``security list-keychains``, so that a privately issued CA installed in
+    the admin or login keychain is trusted alongside Apple's public roots.
+    """
     ctx = ssl.create_default_context()
-    macos_ca_certs = subprocess.run(
-        [
-            "security",
-            "find-certificate",
-            "-a",
-            "-p",
-            "/System/Library/Keychains/SystemRootCertificates.keychain",
-        ],
-        stdout=subprocess.PIPE,
-    ).stdout
+    pem_blocks: list[bytes] = []
+    for keychain in _macos_keychains():
+        try:
+            result = subprocess.run(
+                ["security", "find-certificate", "-a", "-p", keychain],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=KEYCHAIN_TIMEOUT,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            LOG.warning("Could not read certificates from %s: %s", keychain, exc)
+            continue
+        if result.stdout:
+            pem_blocks.append(result.stdout)
 
-    with NamedTemporaryFile("w+b") as tmp_file:
-        tmp_file.write(macos_ca_certs)
+    if not pem_blocks:
+        LOG.warning(
+            "No certificates found in the macOS keychains; TLS verification "
+            "will fail for every server."
+        )
+        return ctx
+
+    with NamedTemporaryFile("w+b", suffix=".pem") as tmp_file:
+        tmp_file.write(b"\n".join(pem_blocks))
+        # Without the flush, the tail of the buffer is still unwritten when
+        # OpenSSL opens the file by name, silently truncating the anchors.
+        tmp_file.flush()
         ctx.load_verify_locations(tmp_file.name)
 
     return ctx
@@ -115,6 +199,10 @@ class WebApiHandler:
         self.fetch_token()
         self._metadata: dict | None = None
 
+    def _open(self, req: Request):
+        """Open ``req`` with this handler's SSL context and timeout."""
+        return urlopen(req, context=self._ctx, timeout=TIMEOUT)
+
     @property
     def access_token(self) -> str:
         """Get the access token. Cached after first call unless refresh needed. Auto-refreshing"""
@@ -150,9 +238,9 @@ class WebApiHandler:
         LOG.debug("Fetching metadata from the server")
         req = Request(
             f"{self.url}/metadata/",
-            headers={"Authorization": f"Bearer {self.access_token}"},
+            headers={"Authorization": f"Bearer {self.access_token}", "User-Agent": "GrampsWebSync"},
         )
-        with urlopen(req, context=self._ctx) as res:
+        with self._open(req) as res:
             self._metadata = json.load(res)
 
     def fetch_token(self) -> None:
@@ -162,10 +250,10 @@ class WebApiHandler:
         req = Request(
             f"{self.url}/token/",
             data=data.encode(),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": "GrampsWebSync"},
         )
         try:
-            with urlopen(req, context=self._ctx) as res:
+            with self._open(req) as res:
                 res_json = json.load(res)
         except (UnicodeDecodeError, json.JSONDecodeError, HTTPError):
             if "/api" not in self.url:
@@ -183,8 +271,16 @@ class WebApiHandler:
         return (self.metadata.get("locale") or {}).get("lang")
 
     def get_api_version(self) -> str | None:
-        """Fet API version info."""
+        """Fetch API version info."""
         return (self.metadata.get("gramps_webapi") or {}).get("version")
+
+    def get_tree_name(self) -> str:
+        """Return the name the server gives the tree it is serving."""
+        return ((self.metadata.get("database") or {}).get("name") or "")
+
+    def has_task_queue(self) -> bool:
+        """Whether the server runs transactions on a background task queue."""
+        return bool((self.metadata.get("server") or {}).get("task_queue"))
 
     def download_xml(self) -> Path:
         """Download an XML export and return the path of the temp file."""
@@ -203,32 +299,29 @@ class WebApiHandler:
 
     def commit(
         self,
-        payload: dict[str, Any],
+        payload: list[dict[str, Any]],
         force: bool = True,
         progress_callback: Callable | None = None,
     ) -> None:
         """Commit the changes to the remote database."""
         if payload:
-            api_version = self.get_api_version()
-            background = api_version and parse_version(api_version) >= (2, 7)
             data = json.dumps(payload).encode()
-            endpoint = f"{self.url}/transactions/"
-            if force:
-                endpoint = f"{endpoint}?force=1"
-                if background:
-                    endpoint = f"{endpoint}&background=1"
-            elif background:
-                endpoint = f"{endpoint}?background=1"
+            # Always in the background. The version this addon requires always
+            # supports it, and a server whose task queue is switched off is
+            # refused at connect time rather than left to time out here.
+            query = "force=1&background=1" if force else "background=1"
+            endpoint = f"{self.url}/transactions/?{query}"
             req = Request(
                 endpoint,
                 data=data,
                 headers={
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self.access_token}",
+                    "User-Agent": "GrampsWebSync"
                 },
             )
             json_response: dict | None = None
-            with urlopen(req, context=self._ctx) as res:
+            with self._open(req) as res:
                 status_code = res.getcode()
                 if status_code == 202:
                     json_response = json.load(res)
@@ -260,36 +353,34 @@ class WebApiHandler:
         endpoint = f"{self.url}/tasks/{task_id}"
         req = Request(
             endpoint,
-            headers={"Authorization": f"Bearer {self.access_token}"},
+            headers={"Authorization": f"Bearer {self.access_token}", "User-Agent": "GrampsWebSync"},
         )
-        try:
-            with urlopen(req, context=self._ctx) as res:
-                task_status = json.load(res)
-                if task_status["state"] == "SUCCESS":
-                    return True
-                if task_status["state"] in {"FAILURE", "REVOKED"}:
-                    LOG.error(f"Server task failed: {task_status}")
-                    raise ValueError(task_status.get("info", "Server task failed"))
-                if progress_callback:
-                    try:
-                        progress = task_status["result_object"]["progress"]
-                    except (KeyError, TypeError):
-                        progress = -1
-                    progress_callback(progress)
-                return False
-        except HTTPError as e:
-            LOG.error(f"HTTPError while fetching task status: {e.code} - {e.reason}")
-        except URLError as e:
-            LOG.error(f"URLError while fetching task status: {e.reason}")
+        # HTTPError and URLError are deliberately not wrapped: the caller
+        # classifies them into specific, actionable messages, which converting
+        # them to a ValueError would flatten into a generic server error.
+        with self._open(req) as res:
+            task_status = json.load(res)
+            if task_status["state"] == "SUCCESS":
+                return True
+            if task_status["state"] in {"FAILURE", "REVOKED"}:
+                LOG.warning("Server task failed: %s", task_status)
+                raise ServerTaskFailed(describe_task_failure(task_status))
+            if progress_callback:
+                try:
+                    progress = task_status["result_object"]["progress"]
+                except (KeyError, TypeError):
+                    progress = -1
+                progress_callback(progress)
+            return False
 
     def get_missing_files(self, retry: bool = True) -> list:
         """Get a list of remote media objects with missing files."""
         req = Request(
             f"{self.url}/media/?filemissing=1",
-            headers={"Authorization": f"Bearer {self.access_token}"},
+            headers={"Authorization": f"Bearer {self.access_token}", "User-Agent": "GrampsWebSync"},
         )
         try:
-            with urlopen(req, context=self._ctx) as res:
+            with self._open(req) as res:
                 res_json = json.load(res)
         except HTTPError as exc:
             if exc.code == 401 and retry:
@@ -305,15 +396,15 @@ class WebApiHandler:
     ):
         """Download a file."""
         if token_url:
-            req = Request(f"{url}?jwt={self.access_token}")
+            req = Request(f"{url}?jwt={self.access_token}", headers={"User-Agent": "GrampsWebSync"})
         else:
             req = Request(
                 url,
-                headers={"Authorization": f"Bearer {self.access_token}"},
+                headers={"Authorization": f"Bearer {self.access_token}", "User-Agent": "GrampsWebSync"},
             )
         try:
-            with urlopen(req, context=self._ctx) as res:
-                chunk_size = 1024
+            with self._open(req) as res:
+                chunk_size = 64 * 1024
                 chunk = res.read(chunk_size)
                 fobj.write(chunk)
                 while chunk:
@@ -334,6 +425,7 @@ class WebApiHandler:
     def download_media_file(self, handle: str, path) -> bool:
         """Download a media file."""
         url = f"{self.url}/media/{handle}/file"
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
             self._download_file(url=url, fobj=f, token_url=True)
         return True
@@ -355,11 +447,11 @@ class WebApiHandler:
         req = Request(
             url,
             data=fobj,
-            headers={"Authorization": f"Bearer {self.access_token}"},
+            headers={"Authorization": f"Bearer {self.access_token}", "User-Agent": "GrampsWebSync"},
             method="PUT",
         )
         try:
-            with urlopen(req, context=self._ctx) as res:
+            with self._open(req) as res:
                 pass
         except HTTPError as exc:
             if exc.code == 401 and retry:

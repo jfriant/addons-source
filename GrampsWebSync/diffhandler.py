@@ -21,7 +21,9 @@
 
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
+from datetime import datetime
 
 from gramps.gen.db import DbTxn
 from gramps.gen.db.base import DbReadBase
@@ -46,12 +48,13 @@ from const import (
     MODE_BIDIRECTIONAL,
     MODE_RESET_TO_LOCAL,
     MODE_RESET_TO_REMOTE,
-    MODE_MERGE,
     OBJ_LST,
     Action,
     Actions,
     GrampsObject,
 )
+
+LOG = logging.getLogger("grampswebsync")
 
 
 class WebApiSyncDiffHandler:
@@ -80,10 +83,19 @@ class WebApiSyncDiffHandler:
             (obj.handle, obj_type): obj for (obj_type, obj) in self._diff_dbs[2]
         }
         self._latest_common_timestamp = self.get_latest_common_timestamp()
+        LOG.debug("Last synced timestamp from config: %s (%s)",
+                 last_synced,
+                 datetime.fromtimestamp(last_synced).strftime('%Y-%m-%d %H:%M:%S %Z') if last_synced else "None")
+        LOG.debug("Latest common timestamp calculated: %s (%s)",
+                 self._latest_common_timestamp,
+                 datetime.fromtimestamp(self._latest_common_timestamp).strftime('%Y-%m-%d %H:%M:%S %Z'))
         if last_synced and last_synced > self._latest_common_timestamp:
             # if the last sync timestamp in the config is later than
             # the latest common timestamp, use it
             self._latest_common_timestamp = int(last_synced)
+            LOG.debug("Using last synced timestamp as cutoff: %s (%s)",
+                     self._latest_common_timestamp,
+                     datetime.fromtimestamp(self._latest_common_timestamp).strftime('%Y-%m-%d %H:%M:%S %Z'))
 
     def get_diff_dbs(
         self,
@@ -163,10 +175,13 @@ class WebApiSyncDiffHandler:
         self,
     ) -> dict[tuple[str, str], tuple[GrampsObject, GrampsObject]]:
         """Objects that have been modifed in both databases."""
+        # bind once: each property access rebuilds the whole dict
+        modified_in_db1 = self.modified_in_db1
+        modified_in_db2 = self.modified_in_db2
         return {
             k: v
             for k, v in self.differences.items()
-            if k not in self.modified_in_db1 and k not in self.modified_in_db2
+            if k not in modified_in_db1 and k not in modified_in_db2
         }
 
     @property
@@ -190,15 +205,17 @@ class WebApiSyncDiffHandler:
     @property
     def deleted_from_db1(self) -> dict[tuple[str, str], GrampsObject]:
         """Objects that have been deleted from db1."""
+        added_to_db2 = self.added_to_db2
         return {
-            k: v for k, v in self.missing_from_db1.items() if k not in self.added_to_db2
+            k: v for k, v in self.missing_from_db1.items() if k not in added_to_db2
         }
 
     @property
     def deleted_from_db2(self) -> dict[tuple[str, str], GrampsObject]:
         """Objects that have been deleted from db2."""
+        added_to_db1 = self.added_to_db1
         return {
-            k: v for k, v in self.missing_from_db2.items() if k not in self.added_to_db1
+            k: v for k, v in self.missing_from_db2.items() if k not in added_to_db1
         }
 
     def get_changes(self) -> Actions:
@@ -218,6 +235,20 @@ class WebApiSyncDiffHandler:
             lst.append((C_UPD_LOC, handle, obj_type, obj1, obj2))
         for (handle, obj_type), (obj1, obj2) in self.modified_in_db2.items():
             lst.append((C_UPD_REM, handle, obj_type, obj1, obj2))
+
+        # Log summary of sync decisions
+        LOG.debug("=== SYNC DECISION SUMMARY ===")
+        LOG.debug("Cutoff timestamp used: %s (%s)",
+                 self._latest_common_timestamp,
+                 datetime.fromtimestamp(self._latest_common_timestamp).strftime('%Y-%m-%d %H:%M:%S %Z'))
+        LOG.debug("Added to local (remote objects): %d", len(self.added_to_db1))
+        LOG.debug("Added to remote (local objects): %d", len(self.added_to_db2))
+        LOG.debug("Deleted from local: %d", len(self.deleted_from_db1))
+        LOG.debug("Deleted from remote: %d", len(self.deleted_from_db2))
+        LOG.debug("Modified in local: %d", len(self.modified_in_db1))
+        LOG.debug("Modified in remote: %d", len(self.modified_in_db2))
+        LOG.debug("Modified in both: %d", len(self.modified_in_both))
+        LOG.debug("=== END SUMMARY ===")
         return lst
 
     def get_actions(self) -> Actions:
@@ -315,16 +346,6 @@ def changes_to_actions(changes, sync_mode: int) -> Actions:
             C_DEL_LOC: A_ADD_LOC,
             C_DEL_REM: A_DEL_LOC,
             C_UPD_LOC: A_UPD_LOC,
-            C_UPD_REM: A_UPD_LOC,
-        }
-    elif sync_mode == MODE_MERGE:
-        change_to_action = {
-            C_UPD_BOTH: A_MRG_REM,
-            C_ADD_LOC: A_ADD_REM,
-            C_ADD_REM: A_ADD_LOC,
-            C_DEL_LOC: A_ADD_LOC,
-            C_DEL_REM: A_ADD_REM,
-            C_UPD_LOC: A_UPD_REM,
             C_UPD_REM: A_UPD_LOC,
         }
     else:
